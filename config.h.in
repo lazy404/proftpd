@@ -121,9 +121,6 @@
 /* Define if you have the <syslog.h> header file. */
 #undef HAVE_SYSLOG_H
 
-/* Define if you already have a typedef for timer_t */
-#undef HAVE_TIMER_T
-
 /* Define if you have the tzname global variable.  */
 #undef HAVE_TZNAME
 
@@ -306,6 +303,9 @@
 /* Define if you have the freeaddrinfo function.  */
 #undef HAVE_FREEADDRINFO
 
+/* Define if you have the fsync function.  */
+#undef HAVE_FSYNC
+
 /* Define if you have the futimes function.  */
 #undef HAVE_FUTIMES
 
@@ -420,17 +420,32 @@
 /* Define if you have the MySQL my_make_scrambled_password_323 function.  */
 #undef HAVE_MYSQL_MY_MAKE_SCRAMBLED_PASSWORD_323
 
+/* Define if you have the MySQL mysql_get_ssl_cipher function.  */
+#undef HAVE_MYSQL_MYSQL_GET_SSL_CIPHER
+
+/* Define if you have the MySQL mysql_ssl_set function.  */
+#undef HAVE_MYSQL_MYSQL_SSL_SET
+
 /* Define if you have the nl_langinfo function.  */
 #undef HAVE_NL_LANGINFO
 
 /* Define if you have the pathconf function.  */
 #undef HAVE_PATHCONF
 
+/* Define if you have the PCRE pcre_free_study function.  */
+#undef HAVE_PCRE_PCRE_FREE_STUDY
+
 /* Define if you have the perm_copy_fd function.  */
 #undef HAVE_PERM_COPY_FD
 
 /* Define if you have the Postgres PQescapeStringConn function.  */
 #undef HAVE_POSTGRES_PQESCAPESTRINGCONN
+
+/* Define if you have the Postgres PQgetssl function.  */
+#undef HAVE_POSTGRES_PQGETSSL
+
+/* Define if you have the Postgres PQinitOpenSSL function.  */
+#undef HAVE_POSTGRES_PQINITOPENSSL
 
 /* Define if you have the pstat function.  */
 #undef HAVE_PSTAT
@@ -994,6 +1009,9 @@
  * should be used.
  */
 #undef PR_USE_OPENSSL_NPN
+
+/* Define if OpenSSL OCSP support, if available, should be used.  */
+#undef PR_USE_OPENSSL_OCSP
 
 /* Define if using PCRE support.  */
 #undef PR_USE_PCRE

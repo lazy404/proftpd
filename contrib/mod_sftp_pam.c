@@ -2,7 +2,7 @@
  * ProFTPD: mod_sftp_pam -- a module which provides an SSH2
  *                          "keyboard-interactive" driver using PAM
  *
- * Copyright (c) 2008-2015 TJ Saunders
+ * Copyright (c) 2008-2016 TJ Saunders
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -27,7 +27,7 @@
  * For more information contact TJ Saunders <tj@castaglia.org>.
  *
  * -----DO NOT EDIT BELOW THIS LINE-----
- * $Libraries: -lpam $
+ * $Libraries: -lpam$
  */
 
 #include "conf.h"
@@ -119,7 +119,7 @@ static int sftppam_converse(int nmsgs, PR_PAM_CONST struct pam_message **msgs,
     struct pam_response **resps, void *app_data) {
   register unsigned int i = 0, j = 0;
   array_header *list;
-  unsigned int recvd_count = 0;
+  uint32_t recvd_count = 0;
   const char **recvd_responses = NULL;
   struct pam_response *res = NULL;
 
@@ -754,6 +754,22 @@ static int sftppam_sess_init(void) {
     if (engine == FALSE) {
       (void) pr_log_writefile(sftp_logfd, MOD_SFTP_PAM_VERSION,
         "disabled by SFTPPAMEngine setting, unregistered 'pam' driver");
+      sftp_kbdint_unregister_driver("pam");
+      return 0;
+    }
+  }
+
+  /* To preserve the principle of least surprise, also check for the AuthPAM
+   * directive.
+   */
+  c = find_config(main_server->conf, CONF_PARAM, "AuthPAM", FALSE);
+  if (c != NULL) {
+    unsigned char auth_pam;
+
+    auth_pam = *((unsigned char *) c->argv[0]);
+    if (auth_pam == FALSE) {
+      (void) pr_log_writefile(sftp_logfd, MOD_SFTP_PAM_VERSION,
+        "disabled by AuthPAM setting, unregistered 'pam' driver");
       sftp_kbdint_unregister_driver("pam");
       return 0;
     }

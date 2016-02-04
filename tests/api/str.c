@@ -1,6 +1,6 @@
 /*
  * ProFTPD - FTP server testsuite
- * Copyright (c) 2008-2015 The ProFTPD Project team
+ * Copyright (c) 2008-2016 The ProFTPD Project team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -140,6 +140,7 @@ START_TEST (sstrcat_test) {
 
   fail_unless(dst[1] == 0, "Failed to terminate destination buffer");
 
+  mark_point();
   src[0] = 'f';
   src[1] = '\0';
   dst[0] = 'e';
@@ -147,28 +148,45 @@ START_TEST (sstrcat_test) {
   res = sstrcat(dst, src, 3);
   fail_unless(res == dst, "Returned wrong destination buffer");
 
+  mark_point();
   fail_unless(dst[0] == 'e',
     "Failed to preserve destination buffer (expected '%c' at index 0, "
     "got '%c')", 'e', dst[0]);
 
+  mark_point();
   fail_unless(dst[1] == 'f',
     "Failed to copy source buffer (expected '%c' at index 1, got '%c')",
     'f', dst[1]);
 
+  mark_point();
   fail_unless(dst[2] == 0, "Failed to terminate destination buffer");
 
-  memset(src, c, sizeof(src));
+  mark_point();
+  memset(src, c, sizeof(src)-1);
 
+  /* Note: we need to NUL-terminate the source buffer, for e.g. strlcat(3)
+   * implementations.  Failure to do so can yield SIGABRT/SIGSEGV problems
+   * during e.g. unit tests.
+   */
+  src[sizeof(src)-1] = '\0';
   dst[0] = '\0';
+
+  mark_point();
   res = sstrcat(dst, src, sizeof(dst));
+
+  mark_point();
   fail_unless(res == dst, "Returned wrong destination buffer");
+
+  mark_point();
   fail_unless(dst[sizeof(dst)-1] == 0,
     "Failed to terminate destination buffer");
 
+  mark_point();
   fail_unless(strlen(dst) == (sizeof(dst)-1),
     "Failed to copy all the data (expected len %u, got len %u)",
     sizeof(dst)-1, strlen(dst));
 
+  mark_point();
   for (i = 0; i < sizeof(dst)-1; i++) {
     fail_unless(dst[i] == c, "Copied wrong value (expected '%c', got '%c')",
       c, dst[i]);
@@ -1222,6 +1240,51 @@ START_TEST (strnrstr_test) {
 }
 END_TEST
 
+START_TEST (hex_test) {
+  char *expected, *res;
+  const unsigned char *str;
+
+  res = pr_str_bin2hex(NULL, NULL, 0, 0);
+  fail_unless(res == NULL, "Failed to handle null arguments");
+  fail_unless(errno == EINVAL, "Expected EINVAL (%d), got %s (%d)", EINVAL,
+    strerror(errno), errno);
+
+  res = pr_str_bin2hex(p, NULL, 0, 0);
+  fail_unless(res == NULL, "Failed to handle null data argument");
+  fail_unless(errno == EINVAL, "Expected EINVAL (%d), got %s (%d)", EINVAL,
+    strerror(errno), errno);
+
+  /* Empty string. */
+  str = "foobar";
+  expected = "";
+  res = pr_str_bin2hex(p, str, 0, 0);
+  fail_unless(res != NULL, "Failed to hexify '%s': %s", str, strerror(errno));
+  fail_unless(strcmp(res, expected) == 0, "Expected '%s', got '%s'",
+    expected, res);
+
+  /* default (lowercase) */
+  expected = "666f6f626172";
+  res = pr_str_bin2hex(p, str, strlen(str), 0);
+  fail_unless(res != NULL, "Failed to hexify '%s': %s", str, strerror(errno));
+  fail_unless(strcmp(res, expected) == 0, "Expected '%s', got '%s'",
+    expected, res);
+
+  /* lowercase */
+  expected = "666f6f626172";
+  res = pr_str_bin2hex(p, str, strlen(str), 0);
+  fail_unless(res != NULL, "Failed to hexify '%s': %s", str, strerror(errno));
+  fail_unless(strcmp(res, expected) == 0, "Expected '%s', got '%s'",
+    expected, res);
+
+  /* uppercase */
+  expected = "666F6F626172";
+  res = pr_str_bin2hex(p, str, strlen(str), PR_STR_FL_HEX_USE_UC);
+  fail_unless(res != NULL, "Failed to hexify '%s': %s", str, strerror(errno));
+  fail_unless(strcmp(res, expected) == 0, "Expected '%s', got '%s'",
+    expected, res);
+}
+END_TEST
+
 START_TEST (str2uid_test) {
   int res;
 
@@ -1243,6 +1306,9 @@ START_TEST (uid2str_test) {
 
   res = pr_uid2str(NULL, (uid_t) 1);
   fail_unless(strcmp(res, "1") == 0);
+
+  res = pr_uid2str(NULL, (uid_t) -1);
+  fail_unless(strcmp(res, "-1") == 0);
 }
 END_TEST
 
@@ -1251,6 +1317,39 @@ START_TEST (gid2str_test) {
 
   res = pr_gid2str(NULL, (gid_t) 1);
   fail_unless(strcmp(res, "1") == 0);
+
+  res = pr_gid2str(NULL, (gid_t) -1);
+  fail_unless(strcmp(res, "-1") == 0);
+}
+END_TEST
+
+START_TEST (quote_dir_test) {
+  const char *res;
+  char *expected, *path;
+
+  res = quote_dir(NULL, NULL);
+  fail_unless(res == NULL, "Failed to handle null arguments");
+  fail_unless(errno == EINVAL, "Expected EINVAL (%d), got %s (%d)", EINVAL,
+    strerror(errno), errno);
+
+  res = quote_dir(p, NULL);
+  fail_unless(res == NULL, "Failed to handle null path argument");
+  fail_unless(errno == EINVAL, "Expected EINVAL (%d), got %s (%d)", EINVAL,
+    strerror(errno), errno);
+
+  path = "/tmp/";
+  expected = path;
+  res = quote_dir(p, path);
+  fail_unless(res != NULL, "Failed to quote '%s': %s", path, strerror(errno));
+  fail_unless(strcmp(res, expected) == 0, "Expected '%s', got '%s'", expected,
+    res);
+
+  path = "/\"tmp\"/";
+  expected = "/\"\"tmp\"\"/";
+  res = quote_dir(p, path);
+  fail_unless(res != NULL, "Failed to quote '%s': %s", path, strerror(errno));
+  fail_unless(strcmp(res, expected) == 0, "Expected '%s', got '%s'", expected,
+    res);
 }
 END_TEST
 
@@ -1261,7 +1360,6 @@ Suite *tests_get_str_suite(void) {
   suite = suite_create("str");
 
   testcase = tcase_create("base");
-
   tcase_add_checked_fixture(testcase, set_up, tear_down);
 
   tcase_add_test(testcase, sstrncpy_test);
@@ -1284,13 +1382,14 @@ Suite *tests_get_str_suite(void) {
   tcase_add_test(testcase, is_fnmatch_test);
   tcase_add_test(testcase, get_nbytes_test);
   tcase_add_test(testcase, get_duration_test);
+  tcase_add_test(testcase, hex_test);
   tcase_add_test(testcase, strnrstr_test);
   tcase_add_test(testcase, str2uid_test);
   tcase_add_test(testcase, str2gid_test);
   tcase_add_test(testcase, uid2str_test);
   tcase_add_test(testcase, gid2str_test);
+  tcase_add_test(testcase, quote_dir_test);
 
   suite_add_tcase(suite, testcase);
-
   return suite;
 }

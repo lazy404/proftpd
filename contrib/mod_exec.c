@@ -1,7 +1,7 @@
 /*
  * ProFTPD: mod_exec -- a module for executing external scripts
  *
- * Copyright (c) 2002-2015 TJ Saunders
+ * Copyright (c) 2002-2016 TJ Saunders
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -32,7 +32,7 @@
 # include <sys/resource.h>
 #endif
 
-#define MOD_EXEC_VERSION	"mod_exec/0.9.13"
+#define MOD_EXEC_VERSION	"mod_exec/0.9.14"
 
 /* Make sure the version of proftpd is as necessary. */
 #if PROFTPD_VERSION_NUMBER < 0x0001030402
@@ -40,6 +40,8 @@
 #endif
 
 module exec_module;
+
+#define EXEC_MAX_FD_COUNT		1024
 
 static pool *exec_pool = NULL;
 static int exec_engine = FALSE;
@@ -326,14 +328,14 @@ static void exec_prepare_fds(int stdin_fd, int stdout_fd, int stderr_fd) {
     exec_log("getrlimit() error: %s", strerror(errno));
 
     /* Pick some arbitrary high number. */
-    nfiles = 1024;
+    nfiles = EXEC_MAX_FD_COUNT;
 
   } else {
     nfiles = rlim.rlim_max;
   }
 
 #else /* no RLIMIT_NOFILE or RLIMIT_OFILE */
-   nfiles = 1024;
+   nfiles = EXEC_MAX_FD_COUNT;
 #endif
 
   /* Yes, using a long for the nfiles variable is not quite kosher; it should
@@ -347,8 +349,9 @@ static void exec_prepare_fds(int stdin_fd, int stdout_fd, int stderr_fd) {
    * mod_exec's forked processes never return/exit.)
    */
 
-  if (nfiles < 0) {
-    nfiles = 1024;
+  if (nfiles < 0 ||
+      nfiles > EXEC_MAX_FD_COUNT) {
+    nfiles = EXEC_MAX_FD_COUNT;
   }
 
   /* Close the "non-standard" file descriptors. */
@@ -958,7 +961,8 @@ static char *exec_subst_var(pool *tmp_pool, char *varstr, cmd_rec *cmd) {
   }
 
   ptr = strstr(varstr, "%F");
-  if (ptr != NULL) {
+  if (ptr != NULL &&
+      cmd != NULL) {
     if (pr_cmd_cmp(cmd, PR_CMD_RNTO_ID) == 0) {
       char *path;
 
@@ -999,7 +1003,8 @@ static char *exec_subst_var(pool *tmp_pool, char *varstr, cmd_rec *cmd) {
   }
 
   ptr = strstr(varstr, "%f");
-  if (ptr != NULL) {
+  if (ptr != NULL &&
+      cmd != NULL) {
 
     if (pr_cmd_cmp(cmd, PR_CMD_RNTO_ID) == 0) {
       char *path;
@@ -1067,29 +1072,28 @@ static char *exec_subst_var(pool *tmp_pool, char *varstr, cmd_rec *cmd) {
     char *rfc1413_ident = pr_table_get(session.notes, "mod_ident.rfc1413-ident",
       NULL);
 
-    if (rfc1413_ident == NULL)
+    if (rfc1413_ident == NULL) {
       rfc1413_ident = "UNKNOWN";
+    }
 
     varstr = sreplace(tmp_pool, varstr, "%l", rfc1413_ident, NULL);
   }
 
   ptr = strstr(varstr, "%m");
   if (ptr != NULL) {
-    varstr = sreplace(tmp_pool, varstr, "%m", cmd ? cmd->argv[0] : "",
-      NULL);
+    varstr = sreplace(tmp_pool, varstr, "%m", cmd ? cmd->argv[0] : "", NULL);
   }
 
   ptr = strstr(varstr, "%r");
-  if (ptr != NULL) {
-    if (cmd) {
-      if (pr_cmd_cmp(cmd, PR_CMD_PASS_ID) == 0 &&
-          session.hide_password) {
-        varstr = sreplace(tmp_pool, varstr, "%r", "PASS (hidden)", NULL);
+  if (ptr != NULL &&
+      cmd != NULL) {
+    if (pr_cmd_cmp(cmd, PR_CMD_PASS_ID) == 0 &&
+        session.hide_password) {
+      varstr = sreplace(tmp_pool, varstr, "%r", "PASS (hidden)", NULL);
 
-      } else {
-        varstr = sreplace(tmp_pool, varstr, "%r",
-          pr_cmd_get_displayable_str(cmd, NULL), NULL);
-      }
+    } else {
+      varstr = sreplace(tmp_pool, varstr, "%r",
+        pr_cmd_get_displayable_str(cmd, NULL), NULL);
     }
   }
 
@@ -1122,7 +1126,8 @@ static char *exec_subst_var(pool *tmp_pool, char *varstr, cmd_rec *cmd) {
   }
 
   ptr = strstr(varstr, "%w");
-  if (ptr != NULL) {
+  if (ptr != NULL &&
+      cmd != NULL) {
     char *rnfr_path = "-";
 
     if (pr_cmd_cmp(cmd, PR_CMD_RNTO_ID) == 0) {
@@ -1163,15 +1168,17 @@ static char *exec_subst_var(pool *tmp_pool, char *varstr, cmd_rec *cmd) {
     if (strncmp(key, "%{time:", 7) == 0) {
       char time_str[128], *fmt;
       time_t now;
-      struct tm *time_info;
+      struct tm *tm;
 
       fmt = pstrndup(tmp_pool, key + 7, strlen(key) - 8);
 
       now = time(NULL);
-      time_info = pr_localtime(NULL, &now);
-
       memset(time_str, 0, sizeof(time_str));
-      strftime(time_str, sizeof(time_str), fmt, time_info);
+
+      tm = pr_localtime(NULL, &now);
+      if (tm != NULL) {
+        strftime(time_str, sizeof(time_str), fmt, tm);
+      }
 
       val = pstrdup(tmp_pool, time_str);
 

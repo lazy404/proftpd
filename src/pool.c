@@ -50,9 +50,9 @@ union block_hdr {
 
   /* Actual header */
   struct {
-    char *endp;
+    void *endp;
     union block_hdr *next;
-    char *first_avail;
+    void *first_avail;
   } h;
 };
 
@@ -61,6 +61,8 @@ static union block_hdr *block_freelist = NULL;
 /* Statistics */
 static unsigned int stat_malloc = 0;	/* incr when malloc required */
 static unsigned int stat_freehit = 0;	/* incr when freelist used */
+
+static const char *trace_channel = "pool";
 
 #ifdef PR_USE_DEVEL
 /* Debug flags */
@@ -84,43 +86,37 @@ static void oom_printf(const char *fmt, ...) {
 /* Lowest level memory allocation functions
  */
 
-static void *null_alloc(size_t size) {
-  void *ret = NULL;
-
-  if (size == 0) {
-    /* Yes, this code is correct.
-     *
-     * The size argument is the originally requested amount of memory.
-     * null_alloc() is called because smalloc() returned NULL.  But why,
-     * exactly?  If the requested size is zero, then it may not have been
-     * an error -- or it may be because the system is actually out of memory.
-     * To differentiate, we do a malloc(0) call here if the requested size is
-     * zero.  If malloc(0) returns NULL, then we really do have an error.
-     */
-    ret = malloc(size);
-  }
-
-  if (ret == NULL) {
-    pr_log_pri(PR_LOG_ALERT, "Out of memory!");
+static void null_alloc(void) {
+  pr_log_pri(PR_LOG_ALERT, "Out of memory!");
 #ifdef PR_USE_DEVEL
-    if (debug_flags & PR_POOL_DEBUG_FL_OOM_DUMP_POOLS) {
-      pr_pool_debug_memory(oom_printf);
-    }
-#endif
-    exit(1);
+  if (debug_flags & PR_POOL_DEBUG_FL_OOM_DUMP_POOLS) {
+    pr_pool_debug_memory(oom_printf);
   }
+#endif
 
-  return ret;
+  exit(1);
 }
 
 static void *smalloc(size_t size) {
-  void *ret;
+  void *res;
 
-  ret = malloc(size);
-  if (ret == 0)
-    ret = null_alloc(size);
+  if (size == 0) {
+    /* Avoid zero-length malloc(); on non-POSIX systems, the behavior is
+     * not dependable.  And on POSIX systems, malloc(3) might still return
+     * a "unique pointer" for a zero-length allocation (or NULL).
+     *
+     * Either way, a zero-length allocation request here means that someone
+     * is doing something they should not be doing.
+     */
+    null_alloc();
+  }
 
-  return ret;
+  res = malloc(size);
+  if (res == NULL) {
+    null_alloc();
+  }
+
+  return res;
 }
 
 /* Grab a completely new block from the system pool.  Relies on malloc()
@@ -132,7 +128,7 @@ static union block_hdr *malloc_block(size_t size) {
 
   blok->h.next = NULL;
   blok->h.first_avail = (char *) (blok + 1);
-  blok->h.endp = size + blok->h.first_avail;
+  blok->h.endp = size + (char *) blok->h.first_avail;
 
   return blok;
 }
@@ -204,17 +200,16 @@ static union block_hdr *new_block(int minsz, int exact) {
   /* Check if we have anything of the requested size on our free list first...
    */
   while (blok) {
-    if (minsz <= blok->h.endp - blok->h.first_avail) {
+    if (minsz <= ((char *) blok->h.endp - (char *) blok->h.first_avail)) {
       *lastptr = blok->h.next;
       blok->h.next = NULL;
 
       stat_freehit++;
       return blok;
-
-    } else {
-      lastptr = &blok->h.next;
-      blok = blok->h.next;
     }
+
+    lastptr = &blok->h.next;
+    blok = blok->h.next;
   }
 
   /* Nope...damn.  Have to malloc() a new one. */
@@ -268,7 +263,7 @@ static unsigned long bytes_in_block_list(union block_hdr *blok) {
   unsigned long size = 0;
 
   while (blok) {
-    size += blok->h.endp - (char *) (blok + 1);
+    size += ((char *) blok->h.endp - (char *) (blok + 1));
     blok = blok->h.next;
   }
 
@@ -356,13 +351,36 @@ static void debug_pool_info(void (*debugf)(const char *, ...)) {
   debugf("%u blocks reused", stat_freehit);
 }
 
+static void pool_printf(const char *fmt, ...) {
+  char buf[PR_TUNABLE_BUFFER_SIZE];
+  va_list msg;
+
+  memset(buf, '\0', sizeof(buf));
+
+  va_start(msg, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, msg);
+  va_end(msg);
+
+  buf[sizeof(buf)-1] = '\0';
+  pr_trace_msg(trace_channel, 5, "%s", buf);
+}
+
 void pr_pool_debug_memory(void (*debugf)(const char *, ...)) {
+  if (debugf == NULL) {
+    debugf = pool_printf;
+  }
+
   debugf("Memory pool allocation:");
   debugf("Total %lu bytes allocated", walk_pools(permanent_pool, 0, debugf));
   debug_pool_info(debugf);
 }
 
 int pr_pool_debug_set_flags(int flags) {
+  if (flags < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+
   debug_flags = flags;
   return 0;
 }
@@ -402,7 +420,7 @@ struct pool_rec *make_sub_pool(struct pool_rec *p) {
   blok = new_block(0, FALSE);
 
   new_pool = (pool *) blok->h.first_avail;
-  blok->h.first_avail += POOL_HDR_BYTES;
+  blok->h.first_avail = POOL_HDR_BYTES + (char *) blok->h.first_avail;
 
   memset(new_pool, 0, sizeof(struct pool_rec));
   new_pool->free_first_avail = blok->h.first_avail;
@@ -432,7 +450,7 @@ struct pool_rec *pr_pool_create_sz(struct pool_rec *p, size_t sz) {
   blok = new_block(sz + POOL_HDR_BYTES, TRUE);
 
   new_pool = (pool *) blok->h.first_avail;
-  blok->h.first_avail += POOL_HDR_BYTES;
+  blok->h.first_avail = POOL_HDR_BYTES + (char *) blok->h.first_avail;
 
   memset(new_pool, 0, sizeof(struct pool_rec));
   new_pool->free_first_avail = blok->h.first_avail;
@@ -537,7 +555,6 @@ void destroy_pool(pool *p) {
  */
 
 static void *alloc_pool(struct pool_rec *p, size_t reqsz, int exact) {
-
   /* Round up requested size to an even number of aligned units */
   size_t nclicks = 1 + ((reqsz - 1) / CLICK_SZ);
   size_t sz = nclicks * CLICK_SZ;
@@ -551,13 +568,18 @@ static void *alloc_pool(struct pool_rec *p, size_t reqsz, int exact) {
   char *new_first_avail;
 
   if (reqsz == 0) {
-    /* Don't try to allocate memory of zero length. */
+    /* Don't try to allocate memory of zero length.
+     *
+     * This should NOT happen normally; if it does, by returning NULL we
+     * almost guarantee a null pointer dereference.
+     */
+    errno = EINVAL;
     return NULL;
   }
 
   new_first_avail = first_avail + sz;
 
-  if (new_first_avail <= blok->h.endp) {
+  if (new_first_avail <= (char *) blok->h.endp) {
     blok->h.first_avail = new_first_avail;
     return (void *) first_avail;
   }
@@ -570,7 +592,7 @@ static void *alloc_pool(struct pool_rec *p, size_t reqsz, int exact) {
   p->last = blok;
 
   first_avail = blok->h.first_avail;
-  blok->h.first_avail += sz;
+  blok->h.first_avail = sz + (char *) blok->h.first_avail;
 
   pr_alarms_unblock();
   return (void *) first_avail;
@@ -779,7 +801,13 @@ typedef struct cleanup {
 
 void register_cleanup(pool *p, void *data, void (*plain_cleanup_cb)(void*),
     void (*child_cleanup_cb)(void *)) {
-  cleanup_t *c = pcalloc(p, sizeof(cleanup_t));
+  cleanup_t *c;
+
+  if (p == NULL) {
+    return;
+  }
+
+  c = pcalloc(p, sizeof(cleanup_t));
   c->data = data;
   c->plain_cleanup_cb = plain_cleanup_cb;
   c->child_cleanup_cb = child_cleanup_cb;
@@ -790,8 +818,14 @@ void register_cleanup(pool *p, void *data, void (*plain_cleanup_cb)(void*),
 }
 
 void unregister_cleanup(pool *p, void *data, void (*cleanup_cb)(void *)) {
-  cleanup_t *c = p->cleanups;
-  cleanup_t **lastp = &p->cleanups;
+  cleanup_t *c, **lastp;
+
+  if (p == NULL) {
+    return;
+  }
+
+  c = p->cleanups;
+  lastp = &p->cleanups;
 
   while (c) {
     if (c->data == data &&
@@ -811,7 +845,10 @@ void unregister_cleanup(pool *p, void *data, void (*cleanup_cb)(void *)) {
 
 static void run_cleanups(cleanup_t *c) {
   while (c) {
-    (*c->plain_cleanup_cb)(c->data);
+    if (c->plain_cleanup_cb) {
+      (*c->plain_cleanup_cb)(c->data);
+    }
+
     c = c->next;
   }
 }

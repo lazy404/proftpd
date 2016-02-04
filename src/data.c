@@ -2,7 +2,7 @@
  * ProFTPD - FTP server daemon
  * Copyright (c) 1997, 1998 Public Flood Software
  * Copyright (c) 1999, 2000 MacGyver aka Habeeb J. Dihu <macgyver@tos.net>
- * Copyright (c) 2001-2015 The ProFTPD Project team
+ * Copyright (c) 2001-2016 The ProFTPD Project team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -107,9 +107,9 @@ static void data_new_xfer(char *filename, int direction) {
   session.xfer.buflen = 0;
 }
 
-static int data_pasv_open(char *reason, off_t size) {
+static int data_passive_open(char *reason, off_t size) {
   conn_t *c;
-  int rev;
+  int rev, xerrno = 0;
 
   if (reason == NULL &&
       session.xfer.filename) {
@@ -200,18 +200,27 @@ static int data_pasv_open(char *reason, off_t size) {
       "connection: %s", strerror(c->xerrno));
   }
 
+  xerrno = session.d->xerrno;
   pr_response_add_err(R_425, _("Unable to build data connection: %s"),
-    strerror(session.d->xerrno));
+    strerror(xerrno));
   destroy_pool(session.d->pool);
   session.d = NULL;
+
+  errno = xerrno;
   return -1;
 }
 
 static int data_active_open(char *reason, off_t size) {
   conn_t *c;
   int bind_port, rev;
-  pr_netaddr_t *bind_addr;
+  pr_netaddr_t *bind_addr = NULL;
   unsigned char *root_revoke = NULL;
+
+  if (session.c->remote_addr == NULL) {
+    /* An opened but unconnected connection? */
+    errno = EINVAL;
+    return -1;
+  }
 
   if (reason == NULL &&
       session.xfer.filename) {
@@ -233,14 +242,30 @@ static int data_active_open(char *reason, off_t size) {
    */
   bind_port = session.c->local_port-1;
 
-  /* A RootRevoke value of 0 indicates 'false', 1 indicates 'true', and
-   * 2 indicates 'NonCompliantActiveTransfer'.  We change the source port for
-   * a RootRevoke value of 2.
-   */
   root_revoke = get_param_ptr(TOPLEVEL_CONF, "RootRevoke", FALSE);
-  if (root_revoke != NULL &&
-      *root_revoke == 2) {
-    bind_port = INPORT_ANY;
+  if (root_revoke != NULL) {
+    /* A RootRevoke value of 0 indicates 'false', 1 indicates 'true', and
+     * 2 indicates 'NonCompliantActiveTransfer'.  We change the source port for
+     * a RootRevoke value of 2, and for a value of 1, we make sure that
+     * that the port is not a privileged port.
+     */
+    switch (*root_revoke) {
+      case 1:
+        if (bind_port < 1024) {
+          pr_log_debug(DEBUG0, "RootRevoke in effect, unable to bind to local "
+            "port %d for active transfer", bind_port);
+          errno = EPERM;
+          return -1;
+        }
+        break;
+
+      case 2:
+        bind_port = INPORT_ANY;
+        break;
+
+      default:
+        break;
+    }
   }
 
   session.d = pr_inet_create_conn(session.pool, -1, bind_addr, bind_port, TRUE);
@@ -300,17 +325,20 @@ static int data_active_open(char *reason, off_t size) {
     session.d->local_addr, session.d->listen_fd);
 
   if (pr_inet_connect(session.d->pool, session.d, &session.data_addr,
-      session.data_port) == -1) {
+      session.data_port) < 0) {
+    int xerrno = session.d->xerrno;
+
     pr_log_debug(DEBUG6,
       "Error connecting to %s#%u for active data transfer: %s",
       pr_netaddr_get_ipstr(&session.data_addr), session.data_port,
-      strerror(session.d->xerrno));
+      strerror(xerrno));
     pr_response_add_err(R_425, _("Unable to build data connection: %s"),
-      strerror(session.d->xerrno));
-    errno = session.d->xerrno;
+      strerror(xerrno));
 
     destroy_pool(session.d->pool);
     session.d = NULL;
+
+    errno = xerrno;
     return -1;
   }
 
@@ -472,8 +500,8 @@ void pr_data_init(char *filename, int direction) {
 
   } else {
     if (!(session.sf_flags & SF_PASSIVE)) {
-      pr_log_debug(DEBUG0, "data_init oddity: session.xfer exists in "
-        "non-PASV mode.");
+      pr_log_debug(DEBUG5,
+        "data_init oddity: session.xfer exists in non-PASV mode");
     }
 
     session.xfer.direction = direction;
@@ -485,6 +513,31 @@ void pr_data_init(char *filename, int direction) {
 
 int pr_data_open(char *filename, char *reason, int direction, off_t size) {
   int res = 0;
+
+  if (session.c == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if ((session.sf_flags & SF_PASSIVE) ||
+      (session.sf_flags & SF_EPSV_ALL)) {
+    /* For passive transfers, we expect there to already be an existing
+     * data connection...
+     */
+    if (session.d == NULL) {
+      errno = EINVAL;
+      return -1;
+    }
+
+  } else {
+    /* ...but for active transfers, we expect there to NOT be an existing
+     * data connection.
+     */
+    if (session.d != NULL) {
+      errno = session.d->xerrno = EINVAL;
+      return -1;
+    }
+  }
 
   /* Make sure that any abort flags have been cleared. */
   session.sf_flags &= ~(SF_ABORT|SF_POST_ABORT);
@@ -501,24 +554,12 @@ int pr_data_open(char *filename, char *reason, int direction, off_t size) {
   }
 
   /* Passive data transfers... */
-  if (session.sf_flags & SF_PASSIVE ||
-      session.sf_flags & SF_EPSV_ALL) {
-    if (session.d == NULL) {
-      pr_log_pri(PR_LOG_ERR, "Internal error: PASV mode set, but no data "
-        "connection listening");
-      pr_session_disconnect(NULL, PR_SESS_DISCONNECT_BY_APPLICATION, NULL);
-    }
-
-    res = data_pasv_open(reason, size);
+  if ((session.sf_flags & SF_PASSIVE) ||
+      (session.sf_flags & SF_EPSV_ALL)) {
+    res = data_passive_open(reason, size);
 
   /* Active data transfers... */
   } else {
-    if (session.d != NULL) {
-      pr_log_pri(PR_LOG_ERR, "Internal error: non-PASV mode, yet data "
-        "connection already exists?!?");
-      pr_session_disconnect(NULL, PR_SESS_DISCONNECT_BY_APPLICATION, NULL);
-    }
-
     res = data_active_open(reason, size);
   }
 
@@ -839,7 +880,7 @@ void pr_data_abort(int err, int quiet) {
     }
 
     pr_log_pri(PR_LOG_NOTICE, "notice: user %s: aborting transfer: %s",
-      session.user, msg);
+      session.user ? session.user : "(unknown)", msg);
 
     /* If we are aborting, then a 426 response has already been sent,
      * and we don't want to add another to the error queue.
@@ -857,21 +898,13 @@ void pr_data_abort(int err, int quiet) {
 /* From response.c.  XXX Need to provide these symbols another way. */
 extern pr_response_t *resp_list, *resp_err_list;
 
-/* pr_data_xfer() actually transfers the data on the data connection.  ASCII
- * translation is performed if necessary.  `direction' is set when the data
- * connection was opened.
- *
- * We determine if the client buffer is read from or written to.  Returns 0 if
- * reading and data connection closes, or -1 if error (with errno set).
- */
-int pr_data_xfer(char *cl_buf, size_t cl_size) {
-  int len = 0;
-  int total = 0;
-  int res = 0;
+static void poll_ctrl(void) {
+  int res;
 
-  /* Poll the control channel for any commands we should handle, like
-   * QUIT or ABOR.
-   */
+  if (session.c == NULL) {
+    return;
+  }
+
   pr_trace_msg(trace_channel, 4, "polling for commands on control channel");
   pr_netio_set_poll_interval(session.c->instrm, 0);
   res = pr_netio_poll(session.c->instrm);
@@ -910,8 +943,9 @@ int pr_data_xfer(char *cl_buf, size_t cl_size) {
     } else if (cmd != NULL) {
       char *ch;
 
-      for (ch = cmd->argv[0]; *ch; ch++)
+      for (ch = cmd->argv[0]; *ch; ch++) {
         *ch = toupper(*ch);
+      }
 
       cmd->cmd_id = pr_cmd_get_id(cmd->argv[0]);
 
@@ -1021,6 +1055,30 @@ int pr_data_xfer(char *cl_buf, size_t cl_size) {
       pr_response_send(R_500, _("Invalid command: try being more creative"));
     }
   }
+}
+
+/* pr_data_xfer() actually transfers the data on the data connection.  ASCII
+ * translation is performed if necessary.  `direction' is set when the data
+ * connection was opened.
+ *
+ * We determine if the client buffer is read from or written to.  Returns 0 if
+ * reading and data connection closes, or -1 if error (with errno set).
+ */
+int pr_data_xfer(char *cl_buf, size_t cl_size) {
+  int len = 0;
+  int total = 0;
+  int res = 0;
+
+  if (cl_buf == NULL ||
+      cl_size == 0) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  /* Poll the control channel for any commands we should handle, like
+   * QUIT or ABOR.
+   */
+  poll_ctrl();
 
   /* If we don't have a data connection here (e.g. might have been closed
    * by an ABOR), then return zero (no data transferred).
@@ -1049,7 +1107,6 @@ int pr_data_xfer(char *cl_buf, size_t cl_size) {
 
   if (session.xfer.direction == PR_NETIO_IO_RD) {
     char *buf = session.xfer.buf;
-    pr_buffer_t *pbuf;
 
     /* We use ASCII translation if:
      *
@@ -1088,16 +1145,6 @@ int pr_data_xfer(char *cl_buf, size_t cl_size) {
           return -1;
         }
 
-        /* Before we process the data read from the client, generate an event
-         * for any listeners which may want to examine this data.
-         */
-
-        pbuf = pcalloc(session.xfer.p, sizeof(pr_buffer_t));
-        pbuf->buf = buf;
-        pbuf->buflen = len;
-        pbuf->current = pbuf->buf;
-        pbuf->remaining = 0;
-
         if (len > 0 &&
             data_first_byte_read == FALSE) {
           if (pr_trace_get_level(timing_channel)) {
@@ -1113,12 +1160,6 @@ int pr_data_xfer(char *cl_buf, size_t cl_size) {
 
           data_first_byte_read = TRUE;
         }
-
-        pr_event_generate("core.data-read", pbuf);
-
-        /* The event listeners may have changed the data to write out. */
-        buf = pbuf->buf;
-        len = pbuf->buflen - pbuf->remaining;
 
         if (len > 0) {
           buflen += len;
@@ -1218,16 +1259,6 @@ int pr_data_xfer(char *cl_buf, size_t cl_size) {
       }
 
       if (len > 0) {
-        /* Before we process the data read from the client, generate an event
-         * for any listeners which may want to examine this data.
-         */
-
-        pbuf = pcalloc(session.xfer.p, sizeof(pr_buffer_t));
-        pbuf->buf = buf;
-        pbuf->buflen = len;
-        pbuf->current = pbuf->buf;
-        pbuf->remaining = 0;
-
         if (data_first_byte_read == FALSE) {
           if (pr_trace_get_level(timing_channel)) {
             unsigned long elapsed_ms;
@@ -1242,12 +1273,6 @@ int pr_data_xfer(char *cl_buf, size_t cl_size) {
 
           data_first_byte_read = TRUE;
         }
-
-        pr_event_generate("core.data-read", pbuf);
-
-        /* The event listeners may have changed the data to write out. */
-        buf = pbuf->buf;
-        len = pbuf->buflen - pbuf->remaining;
 
         /* Non-ASCII mode doesn't need to use session.xfer.buf */
         if (timeout_stalled) {
@@ -1383,17 +1408,32 @@ pr_sendfile_t pr_data_sendfile(int retr_fd, off_t *offset, off_t count) {
   int rc;
 #endif /* HAVE_AIX_SENDFILE */
 
-  if (session.xfer.direction == PR_NETIO_IO_RD)
+  if (offset == NULL ||
+      count == 0) {
+    errno = EINVAL;
     return -1;
+  }
+
+  if (session.xfer.direction == PR_NETIO_IO_RD) {
+    errno = EPERM;
+    return -1;
+  }
+
+  if (session.d == NULL) {
+    errno = EPERM;
+    return -1;
+  }
 
   flags = fcntl(PR_NETIO_FD(session.d->outstrm), F_GETFL);
-  if (flags == -1)
+  if (flags < 0) {
     return -1;
+  }
 
   /* Set fd to blocking-mode for sendfile() */
   if (flags & O_NONBLOCK) {
-    if (fcntl(PR_NETIO_FD(session.d->outstrm), F_SETFL, flags^O_NONBLOCK) == -1)
+    if (fcntl(PR_NETIO_FD(session.d->outstrm), F_SETFL, flags^O_NONBLOCK) < 0) {
       return -1;
+    }
   }
 
   for (;;) {
@@ -1416,24 +1456,26 @@ pr_sendfile_t pr_data_sendfile(int retr_fd, off_t *offset, off_t count) {
      */
 
 #if defined(HAVE_LINUX_SENDFILE)
-    if (count > INT_MAX)
+    if (count > INT_MAX) {
       count = INT_MAX;
-
+    }
 #elif defined(HAVE_SOLARIS_SENDFILE)
 # if SIZEOF_SIZE_T == SIZEOF_INT
-    if (count > INT_MAX)
+    if (count > INT_MAX) {
       count = INT_MAX;
+    }
 # elif SIZEOF_SIZE_T == SIZEOF_LONG
-    if (count > LONG_MAX)
+    if (count > LONG_MAX) {
       count = LONG_MAX;
+    }
 # elif SIZEOF_SIZE_T == SIZEOF_LONG_LONG
-    if (count > LLONG_MAX)
+    if (count > LLONG_MAX) {
       count = LLONG_MAX;
+    }
 # endif
 #endif /* !HAVE_SOLARIS_SENDFILE */
 
     len = sendfile(PR_NETIO_FD(session.d->outstrm), retr_fd, offset, count);
-
     if (len != -1 &&
         len < count) {
       /* Under Linux semantics, this occurs when a signal has interrupted
@@ -1497,14 +1539,17 @@ pr_sendfile_t pr_data_sendfile(int retr_fd, off_t *offset, off_t count) {
      */
 
 #if SIZEOF_SIZE_T == SIZEOF_INT
-    if (count > UINT_MAX)
+    if (count > UINT_MAX) {
       count = UINT_MAX;
+    }
 #elif SIZEOF_SIZE_T == SIZEOF_LONG
-    if (count > ULONG_MAX)
+    if (count > ULONG_MAX) {
       count = ULONG_MAX;
+    }
 #elif SIZEOF_SIZE_T == SIZEOF_LONG_LONG
-    if (count > ULLONG_MAX)
+    if (count > ULLONG_MAX) {
       count = ULLONG_MAX;
+    }
 #endif
 
     if (sendfile(retr_fd, PR_NETIO_FD(session.d->outstrm), *offset, count,
@@ -1520,10 +1565,10 @@ pr_sendfile_t pr_data_sendfile(int retr_fd, off_t *offset, off_t count) {
      */
 
     res = sendfile(retr_fd, PR_NETIO_FD(session.d->outstrm), *offset, &orig_len,
-        NULL, 0);
+      NULL, 0);
     len = orig_len;
 
-    if (res == -1) {
+    if (res < 0) {
 #elif defined(HAVE_AIX_SENDFILE)
 
     memset(&parms, 0, sizeof(parms));
@@ -1532,10 +1577,10 @@ pr_sendfile_t pr_data_sendfile(int retr_fd, off_t *offset, off_t count) {
     parms.file_offset = (uint64_t) *offset;
     parms.file_bytes = (int64_t) count;
 
-    rc  = send_file(&(PR_NETIO_FD(session.d->outstrm)), &(parms), (uint_t)0);
+    rc = send_file(&(PR_NETIO_FD(session.d->outstrm)), &(parms), (uint_t)0);
     len = (int) parms.bytes_sent;
 
-    if (rc == -1 || rc == 1) {
+    if (rc < -1 || rc == 1) {
 
 #endif /* HAVE_AIX_SENDFILE */
 
@@ -1622,5 +1667,10 @@ pr_sendfile_t pr_data_sendfile(int retr_fd, off_t *offset, off_t count) {
   total += len;
 
   return total;
+}
+#else
+pr_sendfile_t pr_data_sendfile(int retr_fd, off_t *offset, off_t count) {
+  errno = ENOSYS;
+  return -1;
 }
 #endif /* HAVE_SENDFILE */

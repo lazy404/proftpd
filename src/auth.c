@@ -2,7 +2,7 @@
  * ProFTPD - FTP server daemon
  * Copyright (c) 1997, 1998 Public Flood Software
  * Copyright (c) 1999, 2000 MacGyver aka Habeeb J. Dihu <macgyver@tos.net>
- * Copyright (c) 2001-2015 The ProFTPD Project team
+ * Copyright (c) 2001-2016 The ProFTPD Project team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -530,7 +530,12 @@ void pr_auth_endpwent(pool *p) {
   }
 
   if (auth_tab) {
-    pr_trace_msg(trace_channel, 5, "emptying authcache");
+    int item_count;
+
+    item_count = pr_table_count(auth_tab);
+    pr_trace_msg(trace_channel, 5, "emptying authcache (%d %s)", item_count,
+      item_count != 1 ? "items" : "item");
+
     (void) pr_table_empty(auth_tab);
     (void) pr_table_free(auth_tab);
     auth_tab = NULL;
@@ -591,17 +596,20 @@ struct passwd *pr_auth_getpwent(pool *p) {
   }
 
   /* Sanity check */
-  if (res == NULL)
+  if (res == NULL) {
     return NULL;
+  }
 
   /* Make sure the UID and GID are not -1 */
   if (res->pw_uid == (uid_t) -1) {
     pr_log_pri(PR_LOG_WARNING, "error: UID of -1 not allowed");
+    errno = ENOENT;
     return NULL;
   }
 
   if (res->pw_gid == (gid_t) -1) {
     pr_log_pri(PR_LOG_WARNING, "error: GID of -1 not allowed");
+    errno = ENOENT;
     return NULL;
   }
 
@@ -632,12 +640,14 @@ struct group *pr_auth_getgrent(pool *p) {
   }
 
   /* Sanity check */
-  if (res == NULL)
+  if (res == NULL) {
     return NULL;
+  }
 
   /* Make sure the GID is not -1 */
   if (res->gr_gid == (gid_t) -1) {
     pr_log_pri(PR_LOG_WARNING, "error: GID of -1 not allowed");
+    errno = ENOENT;
     return NULL;
   }
 
@@ -678,11 +688,13 @@ struct passwd *pr_auth_getpwnam(pool *p, const char *name) {
   /* Make sure the UID and GID are not -1 */
   if (res->pw_uid == (uid_t) -1) {
     pr_log_pri(PR_LOG_WARNING, "error: UID of -1 not allowed");
+    errno = ENOENT;
     return NULL;
   }
 
   if (res->pw_gid == (gid_t) -1) {
     pr_log_pri(PR_LOG_WARNING, "error: GID of -1 not allowed");
+    errno = ENOENT;
     return NULL;
   }
 
@@ -777,11 +789,13 @@ struct passwd *pr_auth_getpwuid(pool *p, uid_t uid) {
   /* Make sure the UID and GID are not -1 */
   if (res->pw_uid == (uid_t) -1) {
     pr_log_pri(PR_LOG_WARNING, "error: UID of -1 not allowed");
+    errno = ENOENT;
     return NULL;
   }
 
   if (res->pw_gid == (gid_t) -1) {
     pr_log_pri(PR_LOG_WARNING, "error: GID of -1 not allowed");
+    errno = ENOENT;
     return NULL;
   }
 
@@ -823,6 +837,7 @@ struct group *pr_auth_getgrnam(pool *p, const char *name) {
   /* Make sure the GID is not -1 */
   if (res->gr_gid == (gid_t) -1) {
     pr_log_pri(PR_LOG_WARNING, "error: GID of -1 not allowed");
+    errno = ENOENT;
     return NULL;
   }
 
@@ -871,6 +886,7 @@ struct group *pr_auth_getgrgid(pool *p, gid_t gid) {
   /* Make sure the GID is not -1 */
   if (res->gr_gid == (gid_t) -1) {
     pr_log_pri(PR_LOG_WARNING, "error: GID of -1 not allowed");
+    errno = ENOENT;
     return NULL;
   }
 
@@ -1020,24 +1036,25 @@ int pr_auth_authorize(pool *p, const char *name) {
   return res;
 }
 
-int pr_auth_check(pool *p, const char *cpw, const char *name, const char *pw) {
+int pr_auth_check(pool *p, const char *ciphertext_passwd, const char *name,
+    const char *cleartext_passwd) {
   cmd_rec *cmd = NULL;
   modret_t *mr = NULL;
   module *m = NULL;
   int res = PR_AUTH_BADPWD;
 
-  /* Note: it's possible for cpw to be NULL (mod_ldap might do this, for
-   * example), so we cannot enforce that it be non-NULL.
+  /* Note: it's possible for ciphertext_passwd to be NULL (mod_ldap might do
+   * this, for example), so we cannot enforce that it be non-NULL.
    */
 
   if (p == NULL ||
       name == NULL ||
-      pw == NULL) {
+      cleartext_passwd == NULL) {
     errno = EINVAL;
     return -1;
   }
 
-  cmd = make_cmd(p, 3, cpw, name, pw);
+  cmd = make_cmd(p, 3, ciphertext_passwd, name, cleartext_passwd);
 
   /* First, check for any of the modules in the "authenticating only" list
    * of modules.  This is usually only mod_auth_pam, but other modules
@@ -1559,15 +1576,16 @@ config_rec *pr_auth_get_anon_config(pool *p, char **login_name,
       pr_signals_handle();
 
       config_anon_name = get_param_ptr(c->subset, "UserName", FALSE);
-
-      if (!config_anon_name)
+      if (config_anon_name == NULL) {
         config_anon_name = config_user_name;
+      }
 
       if (config_anon_name &&
           strcmp(config_anon_name, *login_name) == 0) {
-         if (anon_name)
-           *anon_name = config_anon_name;
-         break;
+        if (anon_name != NULL) {
+          *anon_name = config_anon_name;
+        }
+        break;
       }
  
     } while ((c = find_config_next(c, c->next, CONF_ANON, NULL,
@@ -1614,23 +1632,32 @@ int pr_auth_banned_by_ftpusers(xaset_t *ctx, const char *user) {
   int res = FALSE;
   unsigned char *use_ftp_users;
 
-  use_ftp_users = get_param_ptr(ctx, "UseFtpUsers", FALSE);
+  if (user == NULL) {
+    return res;
+  }
 
+  use_ftp_users = get_param_ptr(ctx, "UseFtpUsers", FALSE);
   if (use_ftp_users == NULL ||
       *use_ftp_users == TRUE) {
     FILE *fh = NULL;
-    char buf[256];
+    char buf[512];
+    int xerrno;
 
     PRIVS_ROOT
     fh = fopen(PR_FTPUSERS_PATH, "r");
+    xerrno = errno;
     PRIVS_RELINQUISH
 
-    if (fh == NULL)
+    if (fh == NULL) {
+      pr_trace_msg(trace_channel, 14,
+        "error opening '%s' for checking user '%s': %s", PR_FTPUSERS_PATH,
+        user, strerror(xerrno));
       return res;
+    }
 
     memset(buf, '\0', sizeof(buf));
 
-    while (fgets(buf, sizeof(buf)-1, fh)) {
+    while (fgets(buf, sizeof(buf)-1, fh) != NULL) {
       char *ptr;
 
       pr_signals_handle();
@@ -1678,13 +1705,14 @@ int pr_auth_is_valid_shell(xaset_t *ctx, const char *shell) {
     char buf[256];
 
     fh = fopen(PR_VALID_SHELL_PATH, "r");
-    if (fh == NULL)
+    if (fh == NULL) {
       return res;
+    }
 
     res = FALSE;
     memset(buf, '\0', sizeof(buf));
 
-    while (fgets(buf, sizeof(buf)-1, fh)) {
+    while (fgets(buf, sizeof(buf)-1, fh) != NULL) {
       pr_signals_handle();
 
       buf[sizeof(buf)-1] = '\0';
@@ -1707,12 +1735,17 @@ int pr_auth_is_valid_shell(xaset_t *ctx, const char *shell) {
 int pr_auth_chroot(const char *path) {
   int res, xerrno = 0;
   time_t now;
+  char *tz = NULL;
+
+  if (path == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
 
 #if defined(HAVE_SETENV) && \
     defined(__GLIBC__) && \
     defined(__GLIBC_MINOR__) && \
     __GLIBC__ == 2 && __GLIBC_MINOR__ >= 3
-  char *tz;
 
   tz = pr_env_get(session.pool, "TZ"); 
   if (tz == NULL) {
@@ -1727,6 +1760,8 @@ int pr_auth_chroot(const char *path) {
   } else {
     pr_log_debug(DEBUG10, "TZ environment variable already set to '%s'", tz);
   }
+#else
+  (void) tz;
 #endif
 
   pr_log_debug(DEBUG1, "Preparing to chroot to directory '%s'", path);
@@ -1747,7 +1782,7 @@ int pr_auth_chroot(const char *path) {
 
   if (res < 0) {
     pr_log_pri(PR_LOG_ERR, "chroot to '%s' failed for user '%s': %s", path,
-      session.user, strerror(xerrno));
+      session.user ? session.user : "(unknown)", strerror(xerrno));
 
     errno = xerrno;
     return -1;
@@ -1854,8 +1889,9 @@ int set_groups(pool *p, gid_t primary_gid, array_header *suppl_gids) {
   }
 #endif /* PR_DEVEL_COREDUMP */
 
-  if (tmp_pool)
+  if (tmp_pool) {
     destroy_pool(tmp_pool);
+  }
 
   return res;
 }
@@ -1965,7 +2001,7 @@ int pr_auth_cache_set(int enable, unsigned int flags) {
     }
 
     if (flags & PR_AUTH_CACHE_FL_AUTH_MODULE) {
-      auth_caching &= ~PR_AUTH_CACHE_FL_AUTH_MODULE;
+      auth_caching |= PR_AUTH_CACHE_FL_AUTH_MODULE;
       pr_trace_msg(trace_channel, 7, "auth module caching (authcache) enabled");
     }
 
@@ -2011,12 +2047,12 @@ int pr_auth_cache_set(int enable, unsigned int flags) {
 int pr_auth_add_auth_only_module(const char *name) {
   struct auth_module_elt *elt = NULL;
 
-  if (!name) {
+  if (name == NULL) {
     errno = EINVAL;
     return -1;
   }
 
-  if (!auth_pool) {
+  if (auth_pool == NULL) {
     auth_pool = make_sub_pool(permanent_pool);
     pr_pool_tag(auth_pool, "Auth API");
   }
@@ -2058,7 +2094,7 @@ int pr_auth_add_auth_only_module(const char *name) {
 
 int pr_auth_clear_auth_only_modules(void) {
   if (auth_module_list == NULL) {
-    errno = EINVAL;
+    errno = EPERM;
     return -1;
   }
 
@@ -2070,7 +2106,7 @@ int pr_auth_clear_auth_only_modules(void) {
 int pr_auth_remove_auth_only_module(const char *name) {
   struct auth_module_elt *elt = NULL;
 
-  if (!name) {
+  if (name == NULL) {
     errno = EINVAL;
     return -1;
   }
@@ -2079,7 +2115,7 @@ int pr_auth_remove_auth_only_module(const char *name) {
     /* We won't be using the auth-only module cache, so there's no need to
      * accept this.
      */
-    pr_trace_msg(trace_channel, 9, "not removing '%s' to the auth-only list: "
+    pr_trace_msg(trace_channel, 9, "not removing '%s' from the auth-only list: "
       "caching of auth-only modules disabled", name);
     return 0;
   }
@@ -2087,7 +2123,7 @@ int pr_auth_remove_auth_only_module(const char *name) {
   if (auth_module_list == NULL) {
     pr_trace_msg(trace_channel, 9, "not removing '%s' from list: "
       "empty auth-only module list", name);
-    errno = ENOENT;
+    errno = EPERM;
     return -1;
   }
 
@@ -2114,14 +2150,22 @@ char *pr_auth_get_home(pool *p, char *pw_dir) {
   config_rec *c;
   char *home_dir;
 
+  if (p == NULL ||
+      pw_dir == NULL) {
+    errno = EINVAL;
+    return NULL;
+  }
+
   home_dir = pw_dir;
 
   c = find_config(main_server->conf, CONF_PARAM, "RewriteHome", FALSE);
-  if (c == NULL)
+  if (c == NULL) {
     return home_dir;
+  }
 
-  if (*((int *) c->argv[0]) == FALSE)
+  if (*((int *) c->argv[0]) == FALSE) {
     return home_dir;
+  }
 
   /* Rather than using a cmd_rec dispatched to mod_rewrite's PRE_CMD handler,
    * we use an approach with looser coupling to mod_rewrite: stash the
@@ -2164,7 +2208,7 @@ char *pr_auth_get_home(pool *p, char *pw_dir) {
 
 /* Internal use only.  To be called in the session process. */
 int init_auth(void) {
-  if (!auth_pool) {
+  if (auth_pool == NULL) {
     auth_pool = make_sub_pool(permanent_pool);
     pr_pool_tag(auth_pool, "Auth API");
   }

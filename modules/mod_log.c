@@ -2,7 +2,7 @@
  * ProFTPD - FTP server daemon
  * Copyright (c) 1997, 1998 Public Flood Software
  * Copyright (c) 1999, 2000 MacGyver aka Habeeb J. Dihu <macgyver@tos.net>
- * Copyright (c) 2001-2015 The ProFTPD Project team
+ * Copyright (c) 2001-2016 The ProFTPD Project team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -57,7 +57,8 @@ struct logfile_struc {
 
   logformat_t		*lf_format;
 
-  int			lf_classes;
+  int			lf_incl_classes;
+  int			lf_excl_classes;
 
   /* Pointer to the "owning" configuration */
   config_rec		*lf_conf;
@@ -98,12 +99,13 @@ static xaset_t *log_set = NULL;
    %l			- Remote logname (from identd)
    %m			- Request (command) method (RETR, etc)
    %O                   - Total number of "raw" bytes written out to network
-   %P			- Process ID of child serving request
+   %P                   - Process ID of child serving request
    %p			- Port of server serving request
+   %R                   - Response time for command/request, in milliseconds
    %r			- Full request (command)
    %s			- Response code (status)
    %S                   - Response string
-   %T			- Time taken to serve request, in seconds
+   %T			- Time taken to transfer file, in seconds
    %t			- Time
    %{format}t		- Formatted time (strftime(3) format)
    %U                   - Original username sent by client
@@ -114,6 +116,7 @@ static xaset_t *log_set = NULL;
    %{file-modified}     - Indicates whether a file is being modified
                           (i.e. already exists) or not.
    %{file-offset}       - Contains the offset at which the file is read/written
+   %{file-size}         - Contains the file size at the end of the transfer
    %{iso8601}           - ISO-8601 timestamp: YYYY-MM-dd HH:mm:ss,SSS
                             for example: "1999-11-27 15:49:37,459"
    %{microsecs}         - 6 digits of microseconds of current time
@@ -121,8 +124,10 @@ static xaset_t *log_set = NULL;
    %{protocol}          - Current protocol (e.g. "ftp", "sftp", etc)
    %{uid}               - UID of logged-in user
    %{gid}               - Primary GID of logged-in user
-   %{transfer-status}   - "success", "failed", "cancelled", "timeout", or "-"
    %{transfer-failure}  - reason, or "-"
+   %{transfer-millisecs}- Time taken to transfer file, in milliseconds
+   %{transfer-status}   - "success", "failed", "cancelled", "timeout", or "-"
+   %{transfer-type}     - "binary" or "ASCII"
    %{version}           - ProFTPD version
 */
 
@@ -205,6 +210,12 @@ static void logformat(const char *directive, char *nickname, char *fmts) {
           continue;
         }
 
+        if (strncmp(tmp, "{file-size}", 11) == 0) {
+          add_meta(&outs, LOGFMT_META_FILE_SIZE, 0);
+          tmp += 11;
+          continue;
+        }
+
         if (strncmp(tmp, "{gid}", 5) == 0) {
           add_meta(&outs, LOGFMT_META_GID, 0);
           tmp += 5;
@@ -241,6 +252,12 @@ static void logformat(const char *directive, char *nickname, char *fmts) {
           continue;
         }
 
+        if (strncmp(tmp, "{transfer-millisecs}", 20) == 0) {
+          add_meta(&outs, LOGFMT_META_XFER_MS, 0);
+          tmp += 20;
+          continue;
+        }
+
         if (strncmp(tmp, "{transfer-failure}", 18) == 0) {
           add_meta(&outs, LOGFMT_META_XFER_FAILURE, 0);
           tmp += 18;
@@ -250,6 +267,12 @@ static void logformat(const char *directive, char *nickname, char *fmts) {
         if (strncmp(tmp, "{transfer-status}", 17) == 0) {
           add_meta(&outs, LOGFMT_META_XFER_STATUS, 0);
           tmp += 17;
+          continue;
+        }
+
+        if (strncmp(tmp, "{transfer-type}", 15) == 0) {
+          add_meta(&outs, LOGFMT_META_XFER_TYPE, 0);
+          tmp += 15;
           continue;
         }
 
@@ -377,6 +400,10 @@ static void logformat(const char *directive, char *nickname, char *fmts) {
             add_meta(&outs, LOGFMT_META_COMMAND, 0);
             break;
 
+          case 'R':
+            add_meta(&outs, LOGFMT_META_RESPONSE_MS, 0);
+            break;
+
           case 's':
             add_meta(&outs, LOGFMT_META_RESPONSE_CODE, 0);
             break;
@@ -474,8 +501,8 @@ MODRET set_logformat(cmd_rec *cmd) {
   return PR_HANDLED(cmd);
 }
 
-static int parse_classes(char *s, int *classes) {
-  int incl = CL_NONE;
+static int parse_classes(char *s, int *incl_classes, int *excl_classes) {
+  int incl = CL_NONE, excl = CL_NONE;
   char *nextp = NULL;
 
   do {
@@ -502,6 +529,7 @@ static int parse_classes(char *s, int *classes) {
     if (strcasecmp(s, "NONE") == 0) {
       if (exclude) {
         incl = CL_ALL;
+        excl = CL_NONE;
 
       } else {
         incl = CL_NONE;
@@ -510,6 +538,7 @@ static int parse_classes(char *s, int *classes) {
     } else if (strcasecmp(s, "ALL") == 0) {
       if (exclude) {
         incl = CL_NONE;
+        excl = CL_ALL;
 
       } else {
         incl = CL_ALL;
@@ -518,6 +547,7 @@ static int parse_classes(char *s, int *classes) {
     } else if (strcasecmp(s, "AUTH") == 0) {
       if (exclude) {
         incl &= ~CL_AUTH;
+        excl |= CL_AUTH;
 
       } else {
         incl |= CL_AUTH;
@@ -526,6 +556,7 @@ static int parse_classes(char *s, int *classes) {
     } else if (strcasecmp(s, "INFO") == 0) {
       if (exclude) {
         incl &= ~CL_INFO;
+        excl |= CL_INFO;
 
       } else {
         incl |= CL_INFO;
@@ -534,6 +565,7 @@ static int parse_classes(char *s, int *classes) {
     } else if (strcasecmp(s, "DIRS") == 0) {
       if (exclude) {
         incl &= ~CL_DIRS;
+        excl |= CL_DIRS;
 
       } else {
         incl |= CL_DIRS;
@@ -542,6 +574,7 @@ static int parse_classes(char *s, int *classes) {
     } else if (strcasecmp(s, "READ") == 0) {
       if (exclude) {
         incl &= ~CL_READ;
+        excl |= CL_READ;
 
       } else { 
         incl |= CL_READ;
@@ -550,6 +583,7 @@ static int parse_classes(char *s, int *classes) {
     } else if (strcasecmp(s, "WRITE") == 0) {
       if (exclude) {
         incl &= ~CL_WRITE;
+        excl |= CL_WRITE;
 
       } else {
         incl |= CL_WRITE;
@@ -558,6 +592,7 @@ static int parse_classes(char *s, int *classes) {
     } else if (strcasecmp(s, "MISC") == 0) {
       if (exclude) {
         incl &= ~CL_MISC;
+        excl |= CL_MISC;
 
       } else {
         incl |= CL_MISC;
@@ -567,6 +602,7 @@ static int parse_classes(char *s, int *classes) {
                strcasecmp(s, "SECURE") == 0) {
       if (exclude) {
         incl &= ~CL_SEC;
+        excl |= CL_SEC;
 
       } else {
         incl |= CL_SEC;
@@ -575,6 +611,7 @@ static int parse_classes(char *s, int *classes) {
     } else if (strcasecmp(s, "EXIT") == 0) {
       if (exclude) {
         incl &= ~CL_EXIT;
+        excl |= CL_EXIT;
 
       } else {
         incl |= CL_EXIT;
@@ -583,6 +620,7 @@ static int parse_classes(char *s, int *classes) {
     } else if (strcasecmp(s, "SSH") == 0) {
       if (exclude) {
         incl &= ~CL_SSH;
+        excl |= CL_SSH;
 
       } else {
         incl |= CL_SSH;
@@ -591,6 +629,7 @@ static int parse_classes(char *s, int *classes) {
     } else if (strcasecmp(s, "SFTP") == 0) {
       if (exclude) {
         incl &= ~CL_SFTP;
+        excl |= CL_SFTP;
 
       } else {
         incl |= CL_SFTP;
@@ -607,7 +646,8 @@ static int parse_classes(char *s, int *classes) {
 
   } while (s);
 
-  *classes = incl;
+  *incl_classes = incl;
+  *excl_classes = excl;
   return 0;
 }
 
@@ -625,7 +665,7 @@ MODRET set_extendedlog(cmd_rec *cmd) {
     CONF_ERROR(cmd, "Syntax: ExtendedLog file [<cmd-classes> [<nickname>]]");
   }
 
-  c = add_config_param(cmd->argv[0], 3, NULL, NULL, NULL);
+  c = add_config_param(cmd->argv[0], 4, NULL, NULL, NULL, NULL);
 
   path = cmd->argv[1];
   if (strncasecmp(path, "syslog:", 7) == 0) {
@@ -649,10 +689,10 @@ MODRET set_extendedlog(cmd_rec *cmd) {
   }
 
   if (argc > 2) {
-    int incl_classes = 0, res;
+    int incl_classes = 0, excl_classes = 0, res;
 
     /* Parse the given class names, to make sure that they are all valid. */
-    res = parse_classes(cmd->argv[2], &incl_classes);
+    res = parse_classes(cmd->argv[2], &incl_classes, &excl_classes);
     if (res < 0) {
       CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "invalid log class in '",
         cmd->argv[2], "'", NULL));    
@@ -660,13 +700,14 @@ MODRET set_extendedlog(cmd_rec *cmd) {
 
     c->argv[1] = palloc(c->pool, sizeof(int));
     *((int *) c->argv[1]) = incl_classes;
+    c->argv[2] = palloc(c->pool, sizeof(int));
+    *((int *) c->argv[2]) = excl_classes;
   }
 
   if (argc > 3) {
-    c->argv[2] = pstrdup(log_pool, cmd->argv[3]);
+    c->argv[3] = pstrdup(log_pool, cmd->argv[3]);
   }
 
-  c->argc = argc-1;
   return PR_HANDLED(cmd);
 }
 
@@ -709,20 +750,26 @@ MODRET set_systemlog(cmd_rec *cmd) {
 }
 
 static struct tm *_get_gmtoff(int *tz) {
-  time_t tt = time(NULL);
-  struct tm gmt;
-  struct tm *t;
-  int days, hours, minutes;
+  time_t now;
+  struct tm *tm;
 
-  gmt = *gmtime(&tt);
-  t = pr_localtime(NULL, &tt);
+  time(&now);
+  tm = pr_localtime(NULL, &now);
+  if (tm != NULL) {
+    int days, hours, minutes;
+    struct tm *gmt;
 
-  days = t->tm_yday - gmt.tm_yday;
-  hours = ((days < -1 ? 24 : 1 < days ? -24 : days * 24)
-          + t->tm_hour - gmt.tm_hour);
-  minutes = hours * 60 + t->tm_min - gmt.tm_min;
-  *tz = minutes;
-  return t;
+    gmt = gmtime(&now);
+    if (gmt != NULL) {
+      days = tm->tm_yday - gmt->tm_yday;
+      hours = ((days < -1 ? 24 : 1 < days ? -24 : days * 24)
+              + tm->tm_hour - gmt->tm_hour);
+      minutes = hours * 60 + tm->tm_min - gmt->tm_min;
+      *tz = minutes;
+    }
+  }
+
+  return tm;
 }
 
 static char *get_next_meta(pool *p, cmd_rec *cmd, unsigned char **f,
@@ -1396,14 +1443,16 @@ static char *get_next_meta(pool *p, cmd_rec *cmd, unsigned char **f,
 
       gettimeofday(&now, NULL);
       tm = pr_localtime(NULL, (const time_t *) &(now.tv_sec));
+      if (tm != NULL) {
+        fmt_len = strftime(argp, sizeof(arg), "%Y-%m-%d %H:%M:%S", tm);
+        len += fmt_len;
 
-      fmt_len = strftime(argp, sizeof(arg), "%Y-%m-%d %H:%M:%S", tm);
-      len += fmt_len;
+        /* Convert microsecs to millisecs. */
+        millis = now.tv_usec / 1000;
 
-      /* Convert microsecs to millisecs. */
-      millis = now.tv_usec / 1000;
+        len += snprintf(argp + fmt_len, sizeof(arg), ",%03lu", millis);
+      }
 
-      len += snprintf(argp + fmt_len, sizeof(arg), ",%03lu", millis);
       m++;
       break;
     }
@@ -1416,22 +1465,42 @@ static char *get_next_meta(pool *p, cmd_rec *cmd, unsigned char **f,
          */
         if (session.xfer.start_time.tv_sec != 0 ||
             session.xfer.start_time.tv_usec != 0) {
-          struct timeval end_time;
+          uint64_t start_ms = 0, end_ms = 0;
+          float transfer_secs = 0.0;
 
-          gettimeofday(&end_time, NULL);
-          end_time.tv_sec -= session.xfer.start_time.tv_sec;
+          pr_timeval2millis(&(session.xfer.start_time), &start_ms);
+          pr_gettimeofday_millis(&end_ms);
 
-          if (end_time.tv_usec >= session.xfer.start_time.tv_usec) {
-            end_time.tv_usec -= session.xfer.start_time.tv_usec;
+          transfer_secs = (end_ms - start_ms) / 1000.0;
+          len = snprintf(argp, sizeof(arg), "%0.3f", transfer_secs);
 
-          } else {
-            end_time.tv_usec = 1000000L - (session.xfer.start_time.tv_usec -
-              end_time.tv_usec);
-            end_time.tv_sec--;
-          }
+        } else {
+          len = sstrncpy(argp, "-", sizeof(arg));
+        }
 
-          len = snprintf(argp, sizeof(arg), "%ld.%03ld", (long) end_time.tv_sec,
-            (long) (end_time.tv_usec / 1000));
+      } else {
+        len = sstrncpy(argp, "-", sizeof(arg));
+      }
+
+      m++;
+      break;
+
+    case LOGFMT_META_XFER_MS:
+      argp = arg;
+      if (session.xfer.p) {
+        /* Make sure that session.xfer.start_time actually has values (which
+         * is not always the case).
+         */
+        if (session.xfer.start_time.tv_sec != 0 ||
+            session.xfer.start_time.tv_usec != 0) {
+          uint64_t start_ms = 0, end_ms = 0;
+          off_t transfer_ms;
+
+          pr_timeval2millis(&(session.xfer.start_time), &start_ms);
+          pr_gettimeofday_millis(&end_ms);
+
+          transfer_ms = end_ms - start_ms;
+          len = snprintf(argp, sizeof(arg), "%" PR_LU, (pr_off_t) transfer_ms);
 
         } else {
           len = sstrncpy(argp, "-", sizeof(arg));
@@ -1535,6 +1604,29 @@ static char *get_next_meta(pool *p, cmd_rec *cmd, unsigned char **f,
       /* Hack to add return code for proper logging of QUIT command. */
       } else if (pr_cmd_cmp(cmd, PR_CMD_QUIT_ID) == 0) {
         len = sstrncpy(argp, R_221, sizeof(arg));
+
+      } else {
+        len = sstrncpy(argp, "-", sizeof(arg));
+      }
+
+      m++;
+      break;
+    }
+
+    case LOGFMT_META_RESPONSE_MS: {
+      uint64_t *start_ms = NULL;
+
+      argp = arg;
+
+      start_ms = pr_table_get(cmd->notes, "start_ms", NULL);
+      if (start_ms != NULL) {
+        uint64_t end_ms = 0;
+        off_t response_ms;
+
+        pr_gettimeofday_millis(&end_ms);
+
+        response_ms = end_ms - *start_ms;
+        len = snprintf(argp, sizeof(arg), "%" PR_LU, (pr_off_t) response_ms);
 
       } else {
         len = sstrncpy(argp, "-", sizeof(arg));
@@ -1740,6 +1832,47 @@ static char *get_next_meta(pool *p, cmd_rec *cmd, unsigned char **f,
       break;
     }
 
+    case LOGFMT_META_XFER_TYPE: {
+      argp = arg;
+
+      /* If the current command is one that incurs a data transfer, then we
+       * need to do more work.  If not, it's an easy substitution.
+       */
+      if (session.curr_cmd_id == PR_CMD_APPE_ID ||
+          session.curr_cmd_id == PR_CMD_LIST_ID ||
+          session.curr_cmd_id == PR_CMD_MLSD_ID ||
+          session.curr_cmd_id == PR_CMD_NLST_ID ||
+          session.curr_cmd_id == PR_CMD_RETR_ID ||
+          session.curr_cmd_id == PR_CMD_STOR_ID ||
+          session.curr_cmd_id == PR_CMD_STOU_ID) {
+        const char *proto;
+
+        proto = pr_session_get_protocol(0);
+
+        if (strncmp(proto, "sftp", 5) == 0 ||
+            strncmp(proto, "scp", 4) == 0) {
+
+          /* Always binary. */
+          len = sstrncpy(argp, "binary", sizeof(arg));
+
+        } else {
+          if ((session.sf_flags & SF_ASCII) ||
+              (session.sf_flags & SF_ASCII_OVERRIDE)) {
+            len = sstrncpy(argp, "ASCII", sizeof(arg));
+
+          } else {
+            len = sstrncpy(argp, "binary", sizeof(arg));
+          }
+        }
+
+      } else {
+        len = sstrncpy(argp, "-", sizeof(arg));
+      }
+
+      m++;
+      break;
+    }
+
     case LOGFMT_META_VERSION:
       argp = arg;
       len = sstrncpy(argp, PROFTPD_VERSION_TEXT, sizeof(arg));
@@ -1776,6 +1909,28 @@ static char *get_next_meta(pool *p, cmd_rec *cmd, unsigned char **f,
         snprintf(offset_str, sizeof(offset_str)-1, "%" PR_LU,
           (pr_off_t) *offset);
         len = sstrncpy(argp, offset_str, sizeof(arg));
+
+      } else {
+        len = sstrncpy(argp, "-", sizeof(arg));
+      }
+
+      m++;
+      break;
+    }
+
+    case LOGFMT_META_FILE_SIZE: {
+      off_t *file_size;
+
+      argp = arg;
+
+      file_size = pr_table_get(cmd->notes, "mod_xfer.file-size", NULL);
+      if (file_size != NULL) {
+        char size_str[1024];
+
+        memset(size_str, '\0', sizeof(size_str));
+        snprintf(size_str, sizeof(size_str)-1, "%" PR_LU,
+          (pr_off_t) *file_size);
+        len = sstrncpy(argp, size_str, sizeof(arg));
 
       } else {
         len = sstrncpy(argp, "-", sizeof(arg));
@@ -1902,15 +2057,19 @@ MODRET log_any(cmd_rec *cmd) {
       continue;
     }
 
-    if (cmd->cmd_class & lf->lf_classes) {
+    if (cmd->cmd_class & lf->lf_incl_classes) {
       log_cmd = TRUE;
+    }
+
+    if (cmd->cmd_class & lf->lf_excl_classes) {
+      log_cmd = FALSE;
     }
 
     /* If the logging class of this command is unknown (defaults to zero),
      * AND this ExtendedLog is configured to log ALL commands, log it.
      */
     if (cmd->cmd_class == 0 &&
-        lf->lf_classes == CL_ALL) {
+        lf->lf_incl_classes == CL_ALL) {
       log_cmd = TRUE;
     }
 
@@ -2061,13 +2220,13 @@ static int log_init(void) {
 static void find_extendedlogs(void) {
   config_rec *c;
   char *logfname, *logfmt_s = NULL;
-  int incl_classes = CL_ALL;
+  int incl_classes = CL_ALL, excl_classes = CL_NONE;
   logformat_t *logfmt;
   logfile_t *extlog = NULL;
   unsigned long config_flags = (PR_CONFIG_FIND_FL_SKIP_DIR|PR_CONFIG_FIND_FL_SKIP_LIMIT|PR_CONFIG_FIND_FL_SKIP_DYNDIR);
 
-  /* We _do_ actually want the recursion here.  The reason is that we want
-   * to find _all_ ExtendedLog directives in the configuration, including
+  /* We DO actually want the recursion here.  The reason is that we want
+   * to find ALL_ ExtendedLog directives in the configuration, including
    * those in <Anonymous> sections.  We have the ability to use root privs
    * now, to make sure these files can be opened, but after the user has
    * authenticated (and we know for sure whether they're anonymous or not),
@@ -2089,9 +2248,10 @@ static void find_extendedlogs(void) {
 
     if (c->argc > 1) {
       incl_classes = *((int *) c->argv[1]);
+      excl_classes = *((int *) c->argv[2]);
 
-      if (c->argc > 2) {
-        logfmt_s = c->argv[2];
+      if (c->argc > 3) {
+        logfmt_s = c->argv[3];
       }
     }
 
@@ -2142,7 +2302,8 @@ static void find_extendedlogs(void) {
     extlog->lf_filename = pstrdup(session.pool, logfname);
     extlog->lf_fd = -1;
     extlog->lf_syslog_level = -1;
-    extlog->lf_classes = incl_classes;
+    extlog->lf_incl_classes = incl_classes;
+    extlog->lf_excl_classes = excl_classes;
     extlog->lf_format = logfmt;
     extlog->lf_conf = c->parent;
     if (log_set == NULL) {
@@ -2241,7 +2402,7 @@ MODRET log_post_pass(cmd_rec *cmd) {
         /* Go ahead and close the log if it's CL_NONE */
         if (lf->lf_fd != -1 &&
             lf->lf_fd != EXTENDED_LOG_SYSLOG &&
-            lf->lf_classes == CL_NONE) {
+            lf->lf_incl_classes == CL_NONE) {
           pr_log_debug(DEBUG7, "mod_log: closing ExtendedLog '%s' (fd %d)",
             lf->lf_filename, lf->lf_fd);
           (void) close(lf->lf_fd);

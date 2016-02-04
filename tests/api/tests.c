@@ -64,6 +64,10 @@ static struct testsuite_info suites[] = {
   { "ascii",		tests_get_ascii_suite },
   { "help",		tests_get_help_suite },
   { "rlimit",		tests_get_rlimit_suite },
+  { "encode",		tests_get_encode_suite },
+  { "privs",		tests_get_privs_suite },
+  { "display",		tests_get_display_suite },
+  { "misc",		tests_get_misc_suite },
 
   { NULL, NULL }
 };
@@ -126,6 +130,11 @@ int main(int argc, char *argv[]) {
   requested = getenv("PR_TEST_NOFORK");
   if (requested) {
     srunner_set_fork_status(runner, CK_NOFORK);
+  } else {
+    requested = getenv("CK_DEFAULT_TIMEOUT");
+    if (requested == NULL) {
+      setenv("CK_DEFAULT_TIMEOUT", "60", 1);
+    }
   }
 
   srunner_run_all(runner, CK_NORMAL);

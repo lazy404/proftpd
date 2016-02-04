@@ -1,7 +1,7 @@
 /*
  * ProFTPD: mod_facts -- a module for handling "facts" [RFC3659]
  *
- * Copyright (c) 2007-2015 The ProFTPD Project
+ * Copyright (c) 2007-2016 The ProFTPD Project
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -26,7 +26,7 @@
 #include "conf.h"
 #include "privs.h"
 
-#define MOD_FACTS_VERSION		"mod_facts/0.4"
+#define MOD_FACTS_VERSION		"mod_facts/0.6"
 
 #if PROFTPD_VERSION_NUMBER < 0x0001030101
 # error "ProFTPD 1.3.1rc1 or later required"
@@ -43,12 +43,14 @@ static unsigned long facts_opts = 0;
 #define FACTS_OPT_SHOW_UNIX_GROUP	0x00020
 #define FACTS_OPT_SHOW_UNIX_MODE	0x00040
 #define FACTS_OPT_SHOW_UNIX_OWNER	0x00080
+#define FACTS_OPT_SHOW_MEDIA_TYPE	0x00100
 
 static unsigned long facts_mlinfo_opts = 0;
 #define FACTS_MLINFO_FL_SHOW_SYMLINKS			0x00001
 #define FACTS_MLINFO_FL_SHOW_SYMLINKS_USE_SLINK		0x00002
 #define FACTS_MLINFO_FL_NO_CDIR				0x00004
 #define FACTS_MLINFO_FL_APPEND_CRLF			0x00008
+#define FACTS_MLINFO_FL_NO_ADJUSTED_SYMLINKS		0x00010
 
 struct mlinfo {
   pool *pool;
@@ -57,6 +59,7 @@ struct mlinfo {
   const char *type;
   const char *perm;
   const char *path;
+  const char *real_path;
 };
 
 /* Necessary prototypes */
@@ -204,6 +207,28 @@ static time_t facts_mktime(unsigned int year, unsigned int month,
   return res;
 }
 
+static const char *facts_mime_type(struct mlinfo *info) {
+  cmdtable *cmdtab;
+  cmd_rec *cmd;
+  modret_t *res;
+
+  cmdtab = pr_stash_get_symbol2(PR_SYM_HOOK, "mime_type", NULL, NULL, NULL);
+  if (cmdtab == NULL) {
+    errno = EPERM;
+    return NULL;
+  }
+
+  cmd = pr_cmd_alloc(info->pool, 1, info->real_path);
+  res = pr_module_call(cmdtab->m, cmdtab->handler, cmd);
+  if (MODRET_ISHANDLED(res) &&
+      MODRET_HASDATA(res)) {
+    return res->data;
+  }
+
+  errno = ENOENT;
+  return NULL;
+}
+
 static size_t facts_mlinfo_fmt(struct mlinfo *info, char *buf, size_t bufsz,
     int flags) {
   int len;
@@ -215,9 +240,15 @@ static size_t facts_mlinfo_fmt(struct mlinfo *info, char *buf, size_t bufsz,
   ptr = buf;
 
   if (facts_opts & FACTS_OPT_SHOW_MODIFY) {
-    len = snprintf(ptr, bufsz, "modify=%04d%02d%02d%02d%02d%02d;",
-      info->tm->tm_year+1900, info->tm->tm_mon+1, info->tm->tm_mday,
-      info->tm->tm_hour, info->tm->tm_min, info->tm->tm_sec);
+    if (info->tm != NULL) {
+      len = snprintf(ptr, bufsz, "modify=%04d%02d%02d%02d%02d%02d;",
+        info->tm->tm_year+1900, info->tm->tm_mon+1, info->tm->tm_mday,
+        info->tm->tm_hour, info->tm->tm_min, info->tm->tm_sec);
+
+    } else {
+      len = 0;
+    }
+
     buflen += len;
     ptr = buf + buflen;
   }
@@ -268,6 +299,18 @@ static size_t facts_mlinfo_fmt(struct mlinfo *info, char *buf, size_t bufsz,
       pr_uid2str(NULL, info->st.st_uid));
     buflen += len;
     ptr = buf + buflen;
+  }
+
+  if (facts_opts & FACTS_OPT_SHOW_MEDIA_TYPE) {
+    const char *mime_type;
+
+    mime_type = facts_mime_type(info);
+    if (mime_type != NULL) {
+      len = snprintf(ptr, bufsz - buflen, "media-type=%s;",
+        mime_type);
+      buflen += len;
+      ptr = buf + buflen;
+    }
   }
 
   if (flags & FACTS_MLINFO_FL_APPEND_CRLF) {
@@ -381,18 +424,47 @@ static int facts_mlinfo_get(struct mlinfo *info, const char *path,
 #ifdef S_ISLNK
     if (S_ISLNK(info->st.st_mode)) {
       struct stat target_st;
+      const char *dst_path;
+      char *link_path;
+      size_t link_pathsz;
+      int len;
 
       /* Now we need to use stat(2) on the path (versus lstat(2)) to get the
        * info for the target, and copy its st_dev and st_ino values to our
        * stat in order to ensure that the unique fact values are the same.
+       *
+       * If we are chrooted, however, then the stat(2) on the symlink will
+       * almost certainly fail, especially if the destination path is an
+       * absolute path.
        */
 
-      res = pr_fsio_stat(path, &target_st);
+      link_pathsz = PR_TUNABLE_PATH_MAX;
+      link_path = pcalloc(info->pool, link_pathsz);
+      len = dir_readlink(info->pool, path, link_path, link_pathsz-1,
+        PR_DIR_READLINK_FL_HANDLE_REL_PATH);
+      if (len > 0 &&
+          len < link_pathsz) {
+        char *best_path;
+
+        best_path = dir_best_path(info->pool, link_path);
+        if (best_path != NULL) {
+          dst_path = best_path;
+
+        } else {
+          dst_path = link_path;
+        }
+
+      } else {
+        dst_path = path;
+      }
+
+      pr_fs_clear_cache2(dst_path);
+      res = pr_fsio_stat(dst_path, &target_st);
       if (res < 0) {
         int xerrno = errno;
 
         pr_log_debug(DEBUG4, MOD_FACTS_VERSION ": error stat'ing '%s': %s",
-          path, strerror(xerrno));
+          dst_path, strerror(xerrno));
 
         errno = xerrno;
         return -1;
@@ -426,7 +498,14 @@ static int facts_mlinfo_get(struct mlinfo *info, const char *path,
           char target[PR_TUNABLE_PATH_MAX+1];
           int targetlen;
 
-          targetlen = pr_fsio_readlink(path, target, sizeof(target)-1);
+          if (flags & FACTS_MLINFO_FL_NO_ADJUSTED_SYMLINKS) {
+            targetlen = pr_fsio_readlink(path, target, sizeof(target)-1);
+
+          } else {
+            sstrncpy(target, dst_path, sizeof(target)-1);
+            targetlen = len;
+          }
+
           if (targetlen < 0) { 
             int xerrno = errno;
 
@@ -479,6 +558,9 @@ static int facts_mlinfo_get(struct mlinfo *info, const char *path,
        */
 
       perm = pstrcat(info->pool, perm, "adfr", NULL);
+
+    } else {
+      perm = pstrcat(info->pool, perm, "dfr", NULL);
     }
 
     if (pr_fsio_access(path, W_OK, session.uid, session.gid,
@@ -530,6 +612,7 @@ static int facts_mlinfo_get(struct mlinfo *info, const char *path,
     info->st.st_mode = *mode;
   }
 
+  info->real_path = pstrdup(info->pool, path);
   return 0;
 }
 
@@ -607,6 +690,14 @@ static void facts_mlst_feat_add(pool *p) {
 
   } else {
     feat_str = pstrcat(p, feat_str, ";", NULL);
+  }
+
+  /* Note: we only show the 'media-type' fact IFF mod_mime is present AND
+   * is enabled via MIMEEngine.
+   */
+  if (pr_module_exists("mod_mime.c") == TRUE &&
+      (facts_opts & FACTS_OPT_SHOW_MEDIA_TYPE)) {
+    feat_str = pstrcat(p, feat_str, "media-type*;", NULL);
   }
 
   feat_str = pstrcat(p, "MLST ", feat_str, NULL);
@@ -1375,6 +1466,9 @@ MODRET facts_mlsd(cmd_rec *cmd) {
 
     pr_fsio_closedir(dirh);
 
+    pr_response_add_err(R_550, "%s: %s", (char *) cmd->argv[0],
+      strerror(xerrno));
+
     pr_cmd_set_errno(cmd, xerrno);
     errno = xerrno;
     return PR_ERROR(cmd);
@@ -1658,7 +1752,7 @@ MODRET facts_opts_mlst(cmd_rec *cmd) {
     /* This response is mandated by RFC3659, therefore it is not
      * localisable.
      */
-    pr_response_add(R_200, "%s", method);
+    pr_response_add(R_200, "%s", "MLST OPTS");
     return PR_HANDLED(cmd);
   }
 
@@ -1709,6 +1803,10 @@ MODRET facts_opts_mlst(cmd_rec *cmd) {
       facts_opts |= FACTS_OPT_SHOW_UNIX_OWNER;
       resp_str = pstrcat(cmd->tmp_pool, resp_str, "UNIX.owner;", NULL);
 
+    } else if (strcasecmp(facts, "media-type") == 0) {
+      facts_opts |= FACTS_OPT_SHOW_MEDIA_TYPE;
+      resp_str = pstrcat(cmd->tmp_pool, resp_str, "media-type;", NULL);
+
     } else {
       pr_log_debug(DEBUG3, MOD_FACTS_VERSION
         ": %s: client requested unsupported fact '%s'", method, facts);
@@ -1722,7 +1820,7 @@ MODRET facts_opts_mlst(cmd_rec *cmd) {
   facts_mlst_feat_add(cmd->tmp_pool);
 
   /* This response is mandated by RFC3659, therefore it is not localisable. */
-  pr_response_add(R_200, "%s %s", method, resp_str);
+  pr_response_add(R_200, "MLST OPTS %s", resp_str);
   return PR_HANDLED(cmd);
 }
 
@@ -1763,8 +1861,11 @@ MODRET set_factsoptions(cmd_rec *cmd) {
   c = add_config_param(cmd->argv[0], 1, NULL);
 
   for (i = 1; i < cmd->argc; i++) {
-    if (strncmp(cmd->argv[i], "UseSlink", 9) == 0) {
+    if (strcmp(cmd->argv[i], "UseSlink") == 0) {
       opts |= FACTS_MLINFO_FL_SHOW_SYMLINKS_USE_SLINK;
+
+    } else if (strcmp(cmd->argv[i], "NoAdjustedSymlinks") == 0) {
+      opts |= FACTS_MLINFO_FL_NO_ADJUSTED_SYMLINKS;
 
     } else {
       CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, ": unknown FactsOption '",
@@ -1795,6 +1896,7 @@ static void facts_sess_reinit_ev(const void *event_data, void *user_data) {
   pr_feat_remove("MFF modify;UNIX.group;UNIX.mode;");
   pr_feat_remove("MFMT");
   pr_feat_remove("TVFS");
+  facts_mlst_feat_remove();
 
   res = facts_sess_init();
   if (res < 0) {
@@ -1845,9 +1947,22 @@ static int facts_sess_init(void) {
     FACTS_OPT_SHOW_TYPE|FACTS_OPT_SHOW_UNIQUE|FACTS_OPT_SHOW_UNIX_GROUP|
     FACTS_OPT_SHOW_UNIX_MODE|FACTS_OPT_SHOW_UNIX_OWNER;
 
-  /* XXX The media-type fact could be supported if mod_mimetype was available
-   * and used.
-   */
+  if (pr_module_exists("mod_mime.c") == TRUE) {
+    /* Check to see if MIMEEngine is enabled.  Yes, this is slightly
+     * naughty, looking at some other module's configuration directives,
+     * but for compliance with RFC 3659, specifically for implementing the
+     * "media-type" fact for MLSx commands, we need to do this.
+     */
+    c = find_config(main_server->conf, CONF_PARAM, "MIMEEngine", FALSE);
+    if (c != NULL) {
+      int engine;
+
+      engine = *((int *) c->argv[0]);
+      if (engine == TRUE) {
+        facts_opts |= FACTS_OPT_SHOW_MEDIA_TYPE;
+      }
+    }
+  }
 
   pr_feat_add("MFF modify;UNIX.group;UNIX.mode;");
   pr_feat_add("MFMT");

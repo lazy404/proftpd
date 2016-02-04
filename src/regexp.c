@@ -2,7 +2,7 @@
  * ProFTPD - FTP server daemon
  * Copyright (c) 1997, 1998 Public Flood Software
  * Copyright (c) 1999, 2000 MacGyver aka Habeeb J. Dihu <macgyver@tos.net>
- * Copyright (c) 2001-2015 The ProFTPD Project team
+ * Copyright (c) 2001-2016 The ProFTPD Project team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -31,6 +31,8 @@
 #ifdef PR_USE_REGEX
 
 #ifdef PR_USE_PCRE
+#include <pcre.h>
+
 struct regexp_rec {
   pool *regex_pool;
 
@@ -74,6 +76,28 @@ static array_header *regexp_list = NULL;
 
 static const char *trace_channel = "regexp";
 
+static void regexp_free(pr_regex_t *pre) {
+#ifdef PR_USE_PCRE
+  if (pre->pcre != NULL) {
+# if defined(HAVE_PCRE_PCRE_FREE_STUDY)
+    pcre_free_study(pre->pcre_extra);
+# endif /* HAVE_PCRE_PCRE_FREE_STUDY */
+    pre->pcre_extra = NULL;
+    pcre_free(pre->pcre);
+    pre->pcre = NULL;
+  }
+#endif /* PR_USE_PCRE */
+
+  if (pre->re != NULL) {
+    /* This frees memory associated with this pointer by regcomp(3). */
+    regfree(pre->re);
+    pre->re = NULL;
+  }
+
+  pre->pattern = NULL;
+  destroy_pool(pre->regex_pool);
+}
+
 static void regexp_cleanup(void) {
   /* Only perform this cleanup if necessary */
   if (regexp_pool) {
@@ -82,23 +106,8 @@ static void regexp_cleanup(void) {
 
     for (i = 0; i < regexp_list->nelts; i++) {
       if (pres[i] != NULL) {
-
-#ifdef PR_USE_PCRE
-        if (pres[i]->pcre != NULL) {
-          /* This frees memory associated with this pointer by regcomp(3). */
-          pcre_free(pres[i]->pcre);
-          pres[i]->pcre = NULL;
-        }
-#endif /* PR_USE_PCRE */
-
-        if (pres[i]->re != NULL) {
-          /* This frees memory associated with this pointer by regcomp(3). */
-          regfree(pres[i]->re);
-          pres[i]->re = NULL;
-        }
-
-        /* This frees the memory allocated for the object itself. */
-        destroy_pool(pres[i]->regex_pool);
+        regexp_free(pres[i]);
+        pres[i] = NULL;
       }
     }
 
@@ -161,25 +170,7 @@ void pr_regexp_free(module *m, pr_regex_t *pre) {
 
     if ((pre != NULL && pres[i] == pre) ||
         (m != NULL && pres[i]->m == m)) {
-
-#ifdef PR_USE_PCRE
-      if (pres[i]->pcre != NULL) {
-        /* This frees memory associated with this pointer by regcomp(3). */
-        pcre_free(pres[i]->pcre);
-        pres[i]->pcre = NULL;
-      }
-#endif /* PR_USE_PCRE */
-
-      if (pres[i]->re != NULL) {
-        /* This frees memory associated with this pointer by regcomp(3). */
-        regfree(pres[i]->re);
-        pres[i]->re = NULL;
-      }
-
-      pres[i]->pattern = NULL;
-
-      /* This frees the memory allocated for the object itself. */
-      destroy_pool(pres[i]->regex_pool);
+      regexp_free(pres[i]);
       pres[i] = NULL;
     }
   }
@@ -202,7 +193,6 @@ static int regexp_compile_pcre(pr_regex_t *pre, const char *pattern,
 
   pre->pcre = pcre_compile(pattern, flags, &(pre->pcre_errstr), &err_offset,
     NULL);
-
   if (pre->pcre == NULL) {
     pr_trace_msg(trace_channel, 4,
       "error compiling pattern '%s' into PCRE regex: %s", pattern,
@@ -217,6 +207,14 @@ static int regexp_compile_pcre(pr_regex_t *pre, const char *pattern,
   pr_trace_msg(trace_channel, 9, "studying pattern '%s' for PCRE extra data",
     pattern);
   pre->pcre_extra = pcre_study(pre->pcre, study_flags, &(pre->pcre_errstr));
+  if (pre->pcre_extra == NULL) {
+    if (pre->pcre_errstr != NULL) {
+      pr_trace_msg(trace_channel, 4,
+        "error studying pattern '%s' for PCRE regex: %s", pattern,
+        pre->pcre_errstr);
+    }
+  }
+
   return 0;
 }
 #endif /* PR_USE_PCRE */
@@ -306,11 +304,6 @@ const char *pr_regexp_get_pattern(const pr_regex_t *pre) {
 static int regexp_exec_pcre(pr_regex_t *pre, const char *str,
     size_t nmatches, regmatch_t *matches, int flags, unsigned long match_limit,
     unsigned long match_limit_recursion) {
-  if (pre == NULL ||
-      str == NULL) {
-    errno = EINVAL;
-    return -1;
-  }
 
   if (pre->pcre != NULL) {
     int res;

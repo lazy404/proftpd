@@ -2,7 +2,7 @@
  * ProFTPD: mod_quotatab -- a module for managing FTP byte/file quotas via
  *                          centralized tables
  *
- * Copyright (c) 2001-2015 TJ Saunders
+ * Copyright (c) 2001-2016 TJ Saunders
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -169,6 +169,7 @@ static unsigned long quotatab_opts = 0UL;
 MODRET quotatab_pre_stor(cmd_rec *);
 MODRET quotatab_post_stor(cmd_rec *);
 MODRET quotatab_post_stor_err(cmd_rec *);
+static int quotatab_sess_init(void);
 
 static int quotatab_rlock(quota_table_t *);
 static int quotatab_runlock(quota_table_t *);
@@ -883,6 +884,93 @@ int quotatab_unregister_backend(const char *backend, unsigned int srcs) {
   return 0;
 }
 
+unsigned char quotatab_lookup_default(quota_tabtype_t tab_type, void *ptr,
+    const char *name, quota_type_t quota_type) {
+  config_rec *c;
+
+  c = find_config(main_server->conf, CONF_PARAM, "QuotaDefault", FALSE);
+  while (c != NULL) {
+    char *type_str;
+    quota_limit_t *limit;
+
+    pr_signals_handle();
+
+    type_str = c->argv[0];
+
+    /* What quota type is being looked up, and what kind does this QuotaDefault
+     * provide?
+     */
+    switch (quota_type) {
+      case USER_QUOTA:
+        if (strncasecmp(type_str, "user", 5) != 0) {
+          c = find_config_next(c, c->next, CONF_PARAM, "QuotaDefault", FALSE);
+          continue;
+        }
+        break;
+
+      case GROUP_QUOTA:
+        if (strncasecmp(type_str, "group", 6) != 0) {
+          c = find_config_next(c, c->next, CONF_PARAM, "QuotaDefault", FALSE);
+          continue;
+        }
+        break;
+
+      case CLASS_QUOTA:
+        if (strncasecmp(type_str, "class", 6) != 0) {
+          c = find_config_next(c, c->next, CONF_PARAM, "QuotaDefault", FALSE);
+          continue;
+        }
+        break;
+
+      case ALL_QUOTA:
+        if (strncasecmp(type_str, "all", 4) != 0) {
+          c = find_config_next(c, c->next, CONF_PARAM, "QuotaDefault", FALSE);
+          continue;
+        }
+        break;
+
+       default:
+         c = find_config_next(c, c->next, CONF_PARAM, "QuotaDefault", FALSE);
+        continue;
+    }
+
+    limit = ptr;
+
+    /* Retrieve the limit record (8 values):
+     *
+     *  per_session
+     *  limit_type
+     *  bytes_{in,out,xfer}_avail
+     *  files_{in,out,xfer}_avail
+     */
+
+    memmove(limit->name, name, strlen(name) + 1);
+    limit->quota_type = quota_type;
+
+    limit->quota_per_session = pr_str_is_boolean(c->argv[1]);
+
+    if (strncasecmp(c->argv[2], "soft", 5) == 0) {
+      limit->quota_limit_type = SOFT_LIMIT;
+
+    } else if (strncasecmp(c->argv[2], "hard", 5) == 0) {
+      limit->quota_limit_type = HARD_LIMIT;
+    }
+
+    limit->bytes_in_avail = atof(c->argv[3]);
+    limit->bytes_out_avail = atof(c->argv[4]);
+    limit->bytes_xfer_avail = atof(c->argv[5]);
+    limit->files_in_avail = atoi(c->argv[6]);
+    limit->files_out_avail = atoi(c->argv[7]);
+    limit->files_xfer_avail = atoi(c->argv[8]);
+
+    quotatab_log("using default %s limit from QuotaDefault directive",
+      type_str);
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
 /* Note: this function will only find the first occurrence of the given
  *  name and type in the table.  This means that if there is a malformed
  *  quota table, with duplicate name/type pairs, the duplicates will be
@@ -894,8 +982,8 @@ unsigned char quotatab_lookup(quota_tabtype_t tab_type, void *ptr,
   if (tab_type == TYPE_TALLY) {
 
     /* Make sure the requested table can do lookups. */
-    if (!tally_tab ||
-        !tally_tab->tab_lookup) {
+    if (tally_tab == NULL ||
+        tally_tab->tab_lookup == NULL) {
       errno = EPERM;
       return FALSE;
     }
@@ -913,98 +1001,6 @@ unsigned char quotatab_lookup(quota_tabtype_t tab_type, void *ptr,
 
     } else {
       res = limit_tab->tab_lookup(limit_tab, ptr, name, quota_type);
-    }
-
-    /* If no limit has been found at this point, AND if a QuotaDefault
-     * directive has been configured, use that configured default.
-     */
-    if (res == FALSE) {
-      config_rec *c;
-
-      c = find_config(main_server->conf, CONF_PARAM, "QuotaDefault", FALSE);
-      while (c != NULL) {
-        char *type_str;
-        quota_limit_t *limit;
-
-        pr_signals_handle();
-
-        type_str = c->argv[0];
-
-        /* What quota type is being looked up, and what kind does this
-         * QuotaDefault provide?
-         */
-        switch (quota_type) {
-          case USER_QUOTA:
-            if (strncasecmp(type_str, "user", 5) != 0) {
-              c = find_config_next(c, c->next, CONF_PARAM, "QuotaDefault",
-                FALSE);
-              continue;
-            }
-            break;
-
-          case GROUP_QUOTA:
-            if (strncasecmp(type_str, "group", 6) != 0) {
-              c = find_config_next(c, c->next, CONF_PARAM, "QuotaDefault",
-                FALSE);
-              continue;
-            }
-            break;
-
-          case CLASS_QUOTA:
-            if (strncasecmp(type_str, "class", 6) != 0) {
-              c = find_config_next(c, c->next, CONF_PARAM, "QuotaDefault",
-                FALSE);
-              continue;
-            }
-            break;
-
-          case ALL_QUOTA:
-            if (strncasecmp(type_str, "all", 4) != 0) {
-              c = find_config_next(c, c->next, CONF_PARAM, "QuotaDefault",
-                FALSE);
-              continue;
-            }
-            break;
-
-           default:
-             c = find_config_next(c, c->next, CONF_PARAM, "QuotaDefault",
-              FALSE);
-            continue;
-        }
- 
-        limit = ptr;
-
-        /* Retrieve the limit record (8 values):
-         *
-         *  per_session
-         *  limit_type
-         *  bytes_{in,out,xfer}_avail
-         *  files_{in,out,xfer}_avail
-         */
-
-        memmove(limit->name, name, strlen(name) + 1);
-        limit->quota_type = quota_type;
-
-        limit->quota_per_session = pr_str_is_boolean(c->argv[1]);
-      
-        if (strncasecmp(c->argv[2], "soft", 5) == 0) {
-          limit->quota_limit_type = SOFT_LIMIT;
-          
-        } else if (strncasecmp(c->argv[2], "hard", 5) == 0) {
-          limit->quota_limit_type = HARD_LIMIT;
-        }
-
-        limit->bytes_in_avail = atof(c->argv[3]);
-        limit->bytes_out_avail = atof(c->argv[4]);
-        limit->bytes_xfer_avail = atof(c->argv[5]);
-        limit->files_in_avail = atoi(c->argv[6]);
-        limit->files_out_avail = atoi(c->argv[7]);
-        limit->files_xfer_avail = atoi(c->argv[8]);
-
-        quotatab_log("using default limit from QuotaDefault directive");
-        res = TRUE;
-        break;
-      }
     }
 
     return res;
@@ -2817,6 +2813,145 @@ MODRET quotatab_post_pass(cmd_rec *cmd) {
     }
   }
 
+  if (!have_limit_entry) {
+    if (quotatab_lookup_default(TYPE_LIMIT, &sess_limit, session.user,
+        USER_QUOTA)) {
+      quotatab_log("found limit entry for user '%s'", session.user);
+      have_limit_entry = TRUE;
+
+      if (quotatab_lookup(TYPE_TALLY, &sess_tally, session.user, USER_QUOTA)) {
+        quotatab_log("found tally entry for user '%s'", session.user);
+        have_quota_entry = TRUE;
+
+      } else {
+        if (quotatab_create_tally()) {
+          quotatab_log("created tally entry for user '%s'", session.user);
+          have_quota_entry = TRUE;
+        }
+      }
+
+      quotatab_mutex_lock(F_UNLCK);
+
+      if (have_quota_entry) {
+        if ((quotatab_opts & QUOTA_OPT_SCAN_ON_LOGIN) &&
+            (sess_limit.bytes_in_avail > 0 ||
+             sess_limit.files_in_avail > 0)) {
+          double byte_count = 0;
+          unsigned int file_count = 0;
+          time_t then;
+
+          quotatab_log("ScanOnLogin enabled, scanning current directory '%s' "
+            "for files owned by user '%s'", pr_fs_getcwd(), session.user);
+
+          time(&then);
+          if (quotatab_scan_dir(cmd->tmp_pool, pr_fs_getcwd(), session.uid, -1,
+              0, &byte_count, &file_count) < 0) {
+            quotatab_log("unable to scan '%s': %s", pr_fs_getcwd(),
+              strerror(errno));
+
+          } else {
+            double bytes_diff = (double)
+              (byte_count - sess_tally.bytes_in_used);
+            int files_diff = file_count - sess_tally.files_in_used;
+
+            quotatab_log("found %0.2lf bytes in %u %s for user '%s' "
+              "in %lu secs", byte_count, file_count,
+              file_count != 1 ? "files" : "file", session.user,
+              (unsigned long) time(NULL) - then);
+
+            quotatab_log("updating tally (%0.2lf bytes, %d %s difference)",
+              bytes_diff, files_diff, files_diff != 1 ? "files" : "file");
+
+            /* Write out an updated quota entry */
+            QUOTATAB_TALLY_WRITE(bytes_diff, 0, 0, files_diff, 0, 0);
+          }
+        }
+      }
+    }
+  }
+
+  if (!have_limit_entry) {
+    char *group_name = session.group;
+    gid_t group_id = session.gid;
+
+    if (quotatab_lookup_default(TYPE_LIMIT, &sess_limit, group_name,
+        GROUP_QUOTA)) {
+      quotatab_log("found limit entry for group '%s'", group_name);
+      have_limit_entry = TRUE;
+
+    } else {
+      if (session.groups) {
+        register int i = 0;
+
+        char **group_names = session.groups->elts;
+        gid_t *group_ids = session.gids->elts;
+
+        /* Scan the list of supplemental group memberships for this user. */
+        for (i = 0; i < session.groups->nelts; i++) {
+          group_name = group_names[i];
+          group_id = group_ids[i];
+
+          if (quotatab_lookup_default(TYPE_LIMIT, &sess_limit, group_name,
+              GROUP_QUOTA)) {
+            quotatab_log("found limit entry for group '%s'", group_name);
+            have_limit_entry = TRUE;
+            break;
+          }
+        }
+      }
+    }
+
+    if (have_limit_entry) {
+      if (quotatab_lookup(TYPE_TALLY, &sess_tally, group_name, GROUP_QUOTA)) {
+        quotatab_log("found tally entry for group '%s'", group_name);
+        have_quota_entry = TRUE;
+
+      } else {
+        if (quotatab_create_tally()) {
+          quotatab_log("created tally entry for group '%s'", group_name);
+          have_quota_entry = TRUE;
+        }
+      }
+
+      quotatab_mutex_lock(F_UNLCK);
+
+      if (have_quota_entry) {
+        if ((quotatab_opts & QUOTA_OPT_SCAN_ON_LOGIN) &&
+            (sess_limit.bytes_in_avail > 0 ||
+             sess_limit.files_in_avail > 0)) {
+          double byte_count = 0;
+          unsigned int file_count = 0;
+          time_t then;
+
+          quotatab_log("ScanOnLogin enabled, scanning current directory '%s' "
+            "for files owned by group '%s'", pr_fs_getcwd(), group_name);
+
+          time(&then);
+          if (quotatab_scan_dir(cmd->tmp_pool, pr_fs_getcwd(), -1, group_id,
+              0, &byte_count, &file_count) < 0) {
+            quotatab_log("unable to scan '%s': %s", pr_fs_getcwd(),
+              strerror(errno));
+
+          } else {
+            double bytes_diff = byte_count - sess_tally.bytes_in_used;
+            int files_diff = file_count - sess_tally.files_in_used;
+
+            quotatab_log("found %0.2lf bytes in %u %s for group '%s' "
+              "in %lu secs", byte_count, file_count,
+              file_count != 1 ? "files" : "file", group_name,
+              (unsigned long) time(NULL) - then);
+
+            quotatab_log("updating tally (%0.2lf bytes, %d %s difference)",
+              bytes_diff, files_diff, files_diff != 1 ? "files" : "file");
+
+            /* Write out an updated quota entry */
+            QUOTATAB_TALLY_WRITE(bytes_diff, 0, 0, files_diff, 0, 0);
+          }
+        }
+      }
+    }
+  }
+
   /* Check for a limit and a tally entry for this class. */
   if (!have_limit_entry &&
       session.conn_class != NULL) {
@@ -4155,13 +4290,49 @@ static void quotatab_restart_ev(const void *event_data, void *user_data) {
   return;
 }
 
+static void quotatab_sess_reinit_ev(const void *event_data, void *user_data) {
+  int res;
+
+  /* A HOST command changed the main_server pointer; reinitialize ourselves. */
+
+  pr_event_unregister(&quotatab_module, "core.exit", quotatab_exit_ev);
+  pr_event_unregister(&quotatab_module, "core.session-reinit",
+    quotatab_sess_reinit_ev);
+
+  /* Reset defaults. */
+  use_quotas = FALSE;
+  (void) close(quota_logfd);
+  quota_logfd = -1;
+  quota_logname = NULL;
+  quotatab_opts = 0UL;
+  allow_site_quota = TRUE;
+  use_dirs = FALSE;
+  use_quotas = FALSE;
+  have_quota_entry = FALSE;
+  have_quota_limit_table = FALSE;
+  have_quota_tally_table = FALSE;
+  byte_units = BYTE;
+
+  (void) close(quota_lockfd);
+  quota_lockfd = -1;
+
+  (void) quotatab_close(TYPE_LIMIT);
+  (void) quotatab_close(TYPE_TALLY);
+
+  res = quotatab_sess_init();
+  if (res < 0) {
+    pr_session_disconnect(&quotatab_module,
+      PR_SESS_DISCONNECT_SESSION_INIT_FAILED, NULL);
+  }
+}
+
 /* Initialization routines
  */
 
 static int quotatab_init(void) {
 
   /* Initialize the module's memory pool. */
-  if (!quotatab_pool) {
+  if (quotatab_pool == NULL) {
     quotatab_pool = make_sub_pool(permanent_pool);
     pr_pool_tag(quotatab_pool, MOD_QUOTATAB_VERSION);
   }
@@ -4181,6 +4352,9 @@ static int quotatab_sess_init(void) {
   unsigned char *quotatab_engine = NULL, *quotatab_showquotas = NULL,
     *quotatab_usedirs = NULL;
   quota_units_t *units = NULL;
+
+  pr_event_register(&quotatab_module, "core.session-reinit",
+    quotatab_sess_reinit_ev, NULL);
 
   /* Check to see if quotas are enabled for this server. */
   quotatab_engine = get_param_ptr(main_server->conf, "QuotaEngine", FALSE);

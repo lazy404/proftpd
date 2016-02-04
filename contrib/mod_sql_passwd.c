@@ -1,6 +1,6 @@
 /*
  * ProFTPD: mod_sql_passwd -- Various SQL password handlers
- * Copyright (c) 2009-2015 TJ Saunders
+ * Copyright (c) 2009-2016 TJ Saunders
  *  
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -81,6 +81,9 @@ static int sql_passwd_pbkdf2_len = -1;
 #define SQL_PASSWD_ERR_PBKDF2_BAD_LENGTH		-4
 
 static const char *trace_channel = "sql.passwd";
+
+/* Necessary prototypes */
+static int sql_passwd_sess_init(void);
 
 static cmd_rec *sql_passwd_cmd_create(pool *parent_pool, int argc, ...) {
   pool *cmd_pool = NULL;
@@ -181,7 +184,7 @@ static int get_pbkdf2_config(char *algo, const EVP_MD **md,
   }
 
 #if OPENSSL_VERSION_NUMBER < 0x1000003f
-  /* The necesary OpenSSL support for non-SHA1 digests for PBKDF2 appeared in
+  /* The necessary OpenSSL support for non-SHA1 digests for PBKDF2 appeared in
    * 1.0.0c.
    */
   if (EVP_MD_type(*md) != EVP_MD_type(EVP_sha1())) {
@@ -303,38 +306,27 @@ static unsigned char *sql_passwd_decode(pool *p, unsigned int encoding,
 
 static char *sql_passwd_encode(pool *p, unsigned int encoding,
     unsigned char *data, size_t data_len) {
-  char *buf;
-
-  /* According to RATS, the output buffer for EVP_EncodeBlock() needs to be
-   * 4/3 the size of the input buffer (which is usually EVP_MAX_MD_SIZE).
-   * Let's make it easy, and use an output buffer that's twice the size of the
-   * input buffer.
-   */
-  buf = pcalloc(p, (2 * data_len) + 1);
+  char *buf = NULL;
 
   switch (encoding) {
     case SQL_PASSWD_ENC_USE_BASE64: {
+      /* According to RATS, the output buffer for EVP_EncodeBlock() needs to be
+       * 4/3 the size of the input buffer (which is usually EVP_MAX_MD_SIZE).
+       * Let's make it easy, and use an output buffer that's twice the size of
+       * the input buffer.
+       */
+      buf = pcalloc(p, (2 * data_len) + 1);
       EVP_EncodeBlock((unsigned char *) buf, data, (int) data_len);
       break;
     }
 
     case SQL_PASSWD_ENC_USE_HEX_LC: {
-      register unsigned int i;
-
-      for (i = 0; i < data_len; i++) {
-        sprintf((char *) &(buf[i*2]), "%02x", data[i]);
-      }
-
+      buf = pr_str_bin2hex(p, data, data_len, PR_STR_FL_HEX_USE_LC);
       break;
     }
 
     case SQL_PASSWD_ENC_USE_HEX_UC: {
-      register unsigned int i;
-
-      for (i = 0; i < data_len; i++) {
-        sprintf((char *) &(buf[i*2]), "%02X", data[i]);
-      }
-
+      buf = pr_str_bin2hex(p, data, data_len, PR_STR_FL_HEX_USE_UC);
       break;
     }
 
@@ -913,7 +905,7 @@ MODRET sql_passwd_pre_pass(cmd_rec *cmd) {
   }
 
   c = find_config(main_server->conf, CONF_PARAM, "SQLPasswordUserSalt", FALSE);
-  if (c) {
+  if (c != NULL) {
     char *key;
     unsigned long salt_flags;
 
@@ -924,6 +916,12 @@ MODRET sql_passwd_pre_pass(cmd_rec *cmd) {
       char *user;
 
       user = pr_table_get(session.notes, "mod_auth.orig-user", NULL);
+      if (user == NULL) {
+        pr_log_debug(DEBUG3, MOD_SQL_PASSWD_VERSION
+          ": unable to determine original USER name");
+        return PR_DECLINED(cmd);
+      }
+
       sql_passwd_user_salt = (unsigned char *) user;
       sql_passwd_user_salt_len = strlen(user);
 
@@ -954,6 +952,11 @@ MODRET sql_passwd_pre_pass(cmd_rec *cmd) {
       }
 
       user = pr_table_get(session.notes, "mod_auth.orig-user", NULL);
+      if (user == NULL) {
+        pr_log_debug(DEBUG3, MOD_SQL_PASSWD_VERSION
+          ": unable to determine original USER name");
+        return PR_DECLINED(cmd);
+      }
 
       sql_cmd = sql_passwd_cmd_create(cmd->tmp_pool, 3, "sql_lookup", ptr,
         sql_passwd_get_str(cmd->tmp_pool, user));
@@ -1262,6 +1265,36 @@ MODRET set_sqlpasswdusersalt(cmd_rec *cmd) {
   return PR_HANDLED(cmd);
 }
 
+/* Event listeners
+ */
+
+static void sql_passwd_sess_reinit_ev(const void *event_data, void *user_data) {
+  int res;
+
+  /* A HOST command changed the main_server pointer; reinitialize ourselves. */
+
+  pr_event_unregister(&sql_passwd_module, "core.session-reinit",
+    sql_passwd_sess_reinit_ev);
+
+  sql_passwd_engine = FALSE;
+  sql_passwd_encoding = SQL_PASSWD_ENC_USE_HEX_LC;
+  sql_passwd_salt_encoding = SQL_PASSWD_ENC_USE_NONE;
+  sql_passwd_file_salt = NULL;
+  sql_passwd_file_salt_len = 0;
+  sql_passwd_user_salt = NULL;
+  sql_passwd_user_salt_len = 0;
+  sql_passwd_file_salt_flags = SQL_PASSWD_SALT_FL_APPEND;
+  sql_passwd_user_salt_flags = SQL_PASSWD_SALT_FL_APPEND;
+  sql_passwd_opts = 0UL;
+  sql_passwd_nrounds = 1;
+
+  res = sql_passwd_sess_init();
+  if (res < 0) {
+    pr_session_disconnect(&sql_passwd_module,
+      PR_SESS_DISCONNECT_SESSION_INIT_FAILED, NULL);
+  }
+}
+
 /* Initialization routines
  */
 
@@ -1323,6 +1356,9 @@ static int sql_passwd_init(void) {
 
 static int sql_passwd_sess_init(void) {
   config_rec *c;
+
+  pr_event_register(&sql_passwd_module, "core.session-reinit",
+    sql_passwd_sess_reinit_ev, NULL);
 
   c = find_config(main_server->conf, CONF_PARAM, "SQLPasswordEngine", FALSE);
   if (c != NULL) {

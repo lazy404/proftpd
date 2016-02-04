@@ -2,7 +2,7 @@
  * ProFTPD - FTP server daemon
  * Copyright (c) 1997, 1998 Public Flood Software
  * Copyright (c) 1999, 2000 MacGyver aka Habeeb J. Dihu <macgyver@tos.net>
- * Copyright (c) 2001-2015 The ProFTPD Project team
+ * Copyright (c) 2001-2016 The ProFTPD Project team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -59,12 +59,13 @@ static int fd_set_block(int fd) {
 int pr_log_openfile(const char *log_file, int *log_fd, mode_t log_mode) {
   int res;
   pool *tmp_pool = NULL;
-  char *tmp = NULL, *lf;
+  char *ptr = NULL, *lf;
   unsigned char have_stat = FALSE, *allow_log_symlinks = NULL;
   struct stat st;
 
   /* Sanity check */
-  if (!log_file || !log_fd) {
+  if (log_file == NULL ||
+      log_fd == NULL) {
     errno = EINVAL;
     return -1;
   }
@@ -74,8 +75,8 @@ int pr_log_openfile(const char *log_file, int *log_fd, mode_t log_mode) {
   pr_pool_tag(tmp_pool, "log_openfile() tmp pool");
   lf = pstrdup(tmp_pool, log_file);
 
-  tmp = strrchr(lf, '/');
-  if (tmp == NULL) {
+  ptr = strrchr(lf, '/');
+  if (ptr == NULL) {
     pr_log_debug(DEBUG0, "inappropriate log file: %s", lf);
     destroy_pool(tmp_pool);
 
@@ -86,7 +87,9 @@ int pr_log_openfile(const char *log_file, int *log_fd, mode_t log_mode) {
   /* Set the path separator to zero, in order to obtain the directory
    * name, so that checks of the directory may be made.
    */
-  *tmp = '\0';
+  if (ptr != lf) {
+    *ptr = '\0';
+  }
 
   if (stat(lf, &st) < 0) {
     int xerrno = errno;
@@ -117,7 +120,9 @@ int pr_log_openfile(const char *log_file, int *log_fd, mode_t log_mode) {
   /* Restore the path separator so that checks on the file itself may be
    * done.
    */
-  *tmp = '/';
+  if (ptr != lf) {
+    *ptr = '/';
+  }
 
   allow_log_symlinks = get_param_ptr(main_server->conf, "AllowLogSymlinks",
     FALSE);
@@ -214,8 +219,9 @@ int pr_log_openfile(const char *log_file, int *log_fd, mode_t log_mode) {
 
     /* Stat the file using the descriptor, not the path */
     if (!have_stat &&
-        fstat(*log_fd, &st) != -1)
+        fstat(*log_fd, &st) != -1) {
       have_stat = TRUE;
+    }
 
     if (!have_stat ||
         S_ISLNK(st.st_mode)) {
@@ -241,9 +247,42 @@ int pr_log_openfile(const char *log_file, int *log_fd, mode_t log_mode) {
 
     *log_fd = open(lf, flags, log_mode);
     if (*log_fd < 0) {
+      int xerrno = errno;
+
       destroy_pool(tmp_pool);
+      errno = xerrno;
       return -1;
     }
+  }
+
+  /* Make sure we're dealing with an expected file type (i.e. NOT a
+   * directory).
+   */
+  if (fstat(*log_fd, &st) < 0) {
+    int xerrno = errno;
+
+    pr_log_debug(DEBUG0, "error: unable to stat %s (fd %d): %s", lf, *log_fd,
+      strerror(xerrno));
+
+    close(*log_fd);
+    *log_fd = -1;
+    destroy_pool(tmp_pool);
+
+    errno = xerrno;
+    return -1;
+  }
+
+  if (S_ISDIR(st.st_mode)) {
+    int xerrno = EISDIR;
+
+    pr_log_debug(DEBUG0, "error: unable to use %s: %s", lf, strerror(xerrno));
+
+    close(*log_fd);
+    *log_fd = -1;
+    destroy_pool(tmp_pool);
+
+    errno = xerrno;
+    return -1;
   }
 
   /* Find a usable fd for the just-opened log fd. */
@@ -506,7 +545,10 @@ static void log_write(int priority, int f, char *s, int discard) {
     }
   }
 
-  ptr = get_param_ptr(main_server->conf, "SyslogLevel", FALSE);
+  if (main_server != NULL) {
+    ptr = get_param_ptr(main_server->conf, "SyslogLevel", FALSE);
+  }
+
   if (ptr != NULL) {
     max_priority = *ptr;
 
@@ -592,7 +634,7 @@ static void log_write(int priority, int f, char *s, int discard) {
         continue;
       }
 
-      return;
+      break;
     }
 
     return;
@@ -601,8 +643,9 @@ static void log_write(int priority, int f, char *s, int discard) {
   pr_log_event_generate(PR_LOG_TYPE_SYSLOG, syslog_sockfd, priority, s,
     strlen(s));
 
-  if (set_facility != -1)
+  if (set_facility != -1) {
     f = set_facility;
+  }
 
   if (!syslog_open) {
     syslog_sockfd = pr_openlog("proftpd", LOG_NDELAY|LOG_PID, f);
@@ -835,8 +878,9 @@ void init_log(void) {
   char buf[256];
 
   memset(buf, '\0', sizeof(buf));
-  if (gethostname(buf, sizeof(buf)) == -1)
+  if (gethostname(buf, sizeof(buf)) < 0) {
     sstrncpy(buf, "localhost", sizeof(buf));
+  }
 
   sstrncpy(systemlog_host, (char *) pr_netaddr_validate_dns_str(buf),
     sizeof(systemlog_host));

@@ -2,7 +2,7 @@
  * ProFTPD - FTP server daemon
  * Copyright (c) 1997, 1998 Public Flood Software
  * Copyright (c) 1999, 2000 MacGyver aka Habeeb J. Dihu <macgyver@tos.net>
- * Copyright (c) 2001-2015 The ProFTPD Project
+ * Copyright (c) 2001-2016 The ProFTPD Project
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -55,6 +55,7 @@ static int sendline(int flags, char *fmt, ...)
 #define LS_FL_NO_ERROR_IF_ABSENT	0x0001
 #define LS_FL_LIST_ONLY			0x0002
 #define LS_FL_NLST_ONLY			0x0004
+#define LS_FL_NO_ADJUSTED_SYMLINKS	0x0008
 static unsigned long list_flags = 0;
 
 static unsigned char list_strict_opts = FALSE;
@@ -522,7 +523,8 @@ static int listfile(cmd_rec *cmd, pool *p, const char *resp_code,
     }
 #endif /* PR_USE_NLS */
 
-    if (S_ISLNK(st.st_mode) && (opt_L || !list_show_symlinks)) {
+    if (S_ISLNK(st.st_mode) &&
+        (opt_L || !list_show_symlinks)) {
       /* Attempt to fully dereference symlink */
       struct stat l_st;
 
@@ -540,12 +542,21 @@ static int listfile(cmd_rec *cmd, pool *p, const char *resp_code,
           return 0;
         }
 
-        len = pr_fsio_readlink(name, m, sizeof(m) - 1);
-        if (len < 0)
-          return 0;
+        if (list_flags & LS_FL_NO_ADJUSTED_SYMLINKS) {
+          len = pr_fsio_readlink(name, m, sizeof(m) - 1);
 
-        if (len >= sizeof(m))
+        } else {
+          len = dir_readlink(p, name, m, sizeof(m) - 1,
+            PR_DIR_READLINK_FL_HANDLE_REL_PATH);
+        }
+
+        if (len < 0) {
           return 0;
+        }
+
+        if (len >= sizeof(m)) {
+          return 0;
+        }
 
         m[len] = '\0';
 
@@ -574,7 +585,14 @@ static int listfile(cmd_rec *cmd, pool *p, const char *resp_code,
         return 0;
       }
 
-      len = pr_fsio_readlink(name, l, sizeof(l) - 1);
+      if (list_flags & LS_FL_NO_ADJUSTED_SYMLINKS) {
+        len = pr_fsio_readlink(name, l, sizeof(l) - 1);
+
+      } else {
+        len = dir_readlink(p, name, l, sizeof(l) - 1,
+          PR_DIR_READLINK_FL_HANDLE_REL_PATH);
+      }
+
       if (len < 0) {
         return 0;
       }
@@ -627,10 +645,10 @@ static int listfile(cmd_rec *cmd, pool *p, const char *resp_code,
     }
 
     if (list_times_gmt) {
-      t = pr_gmtime(p, (time_t *) &sort_time);
+      t = pr_gmtime(p, (const time_t *) &sort_time);
 
     } else {
-      t = pr_localtime(p, (time_t *) &sort_time);
+      t = pr_localtime(p, (const time_t *) &sort_time);
     }
 
     if (opt_F) {
@@ -1119,7 +1137,8 @@ static char **sreaddir(const char *dirname, const int sort) {
   struct stat st;
   int i, dir_fd;
   char **p;
-  size_t ssize, dsize;
+  long ssize;
+  size_t dsize;
 
   pr_fs_clear_cache2(dirname);
   if (pr_fsio_stat(dirname, &st) < 0) {
@@ -1405,6 +1424,15 @@ static int listdir(cmd_rec *cmd, pool *workp, const char *resp_code,
           if (dest_workp) {
             destroy_pool(workp);
           }
+
+          /* Explicitly free the memory allocated for containing the list of
+           * filenames.
+           */
+          i = 0;
+          while (dir[i] != NULL) {
+            free(dir[i++]);
+          }
+          free(dir);
 
           return -1;
         }
@@ -1783,7 +1811,7 @@ static int have_options(cmd_rec *cmd, const char *arg) {
  * successful.
  */
 static int dolist(cmd_rec *cmd, const char *opt, const char *resp_code,
-    int clearflags) {
+    int clear_flags) {
   int skiparg = 0;
   int glob_flags = 0;
 
@@ -1791,7 +1819,7 @@ static int dolist(cmd_rec *cmd, const char *opt, const char *resp_code,
 
   ls_curtime = time(NULL);
 
-  if (clearflags) {
+  if (clear_flags) {
     opt_1 = opt_A = opt_a = opt_B = opt_C = opt_d = opt_F = opt_h = opt_n =
       opt_r = opt_R = opt_S = opt_t = opt_STAT = opt_L = 0;
   }
@@ -1894,6 +1922,13 @@ static int dolist(cmd_rec *cmd, const char *opt, const char *resp_code,
     /* Open data connection */
     if (!opt_STAT) {
       if (pr_data_open(NULL, "file list", PR_NETIO_IO_WR, 0) < 0) {
+        int xerrno = errno;
+
+        pr_response_add_err(R_450, "%s: %s", (char *) cmd->argv[0],
+          strerror(xerrno));
+
+        pr_cmd_set_errno(cmd, xerrno);
+        errno = xerrno;
         return -1;
       }
 
@@ -1984,7 +2019,7 @@ static int dolist(cmd_rec *cmd, const char *opt, const char *resp_code,
           target_mode = st.st_mode;
 
           if (S_ISLNK(st.st_mode) &&
-              (lmode = symlink_mode((char *) *path)) != 0) {
+              (lmode = symlink_mode2(cmd->tmp_pool, (char *) *path)) != 0) {
             if (opt_L || !list_show_symlinks) {
               st.st_mode = lmode;
             }
@@ -2130,6 +2165,13 @@ static int dolist(cmd_rec *cmd, const char *opt, const char *resp_code,
     /* Open data connection */
     if (!opt_STAT) {
       if (pr_data_open(NULL, "file list", PR_NETIO_IO_WR, 0) < 0) {
+        int xerrno = errno;
+
+        pr_response_add_err(R_450, "%s: %s", (char *) cmd->argv[0], 
+          strerror(xerrno));
+
+        pr_cmd_set_errno(cmd, xerrno);
+        errno = xerrno;
         return -1;
       }
 
@@ -2359,10 +2401,18 @@ static int nlstdir(cmd_rec *cmd, const char *dir) {
       }
     }
 
-    i = pr_fsio_readlink(p, file, sizeof(file) - 1);
+    if (list_flags & LS_FL_NO_ADJUSTED_SYMLINKS) {
+      i = pr_fsio_readlink(p, file, sizeof(file) - 1);
+
+    } else {
+      i = dir_readlink(cmd->tmp_pool, p, file, sizeof(file) - 1,
+        PR_DIR_READLINK_FL_HANDLE_REL_PATH);
+    }
+
     if (i > 0) {
-      if (i >= sizeof(file))
+      if (i >= sizeof(file)) {
         continue;
+      }
 
       file[i] = '\0';
       f = file;
@@ -2372,12 +2422,14 @@ static int nlstdir(cmd_rec *cmd, const char *dir) {
     }
 
     if (ls_perms(workp, cmd, dir_best_path(cmd->tmp_pool, f), &hidden)) {
-      if (hidden)
+      if (hidden) {
         continue;
+      }
 
-      mode = file_mode(f);
-      if (mode == 0)
+      mode = file_mode2(cmd->tmp_pool, f);
+      if (mode == 0) {
         continue;
+      }
 
       if (!curdir) {
         char *str = NULL;
@@ -2581,8 +2633,8 @@ MODRET ls_err_nlst(cmd_rec *cmd) {
 MODRET ls_stat(cmd_rec *cmd) {
   struct stat st;
   int res;
-  char *arg = cmd->arg, *decoded_path, *resp_code = NULL;
-  unsigned char *tmp = NULL;
+  char *arg = cmd->arg, *decoded_path, *path, *resp_code = NULL;
+  unsigned char *ptr = NULL;
   mode_t *fake_mode = NULL;
   config_rec *c = NULL;
 
@@ -2671,9 +2723,9 @@ MODRET ls_stat(cmd_rec *cmd) {
     arg++;
   }
 
-  tmp = get_param_ptr(TOPLEVEL_CONF, "ShowSymlinks", FALSE);
-  if (tmp != NULL) {
-    list_show_symlinks = *tmp;
+  ptr = get_param_ptr(TOPLEVEL_CONF, "ShowSymlinks", FALSE);
+  if (ptr != NULL) {
+    list_show_symlinks = *ptr;
   }
 
   list_strict_opts = FALSE;
@@ -2748,21 +2800,28 @@ MODRET ls_stat(cmd_rec *cmd) {
     have_fake_mode = FALSE;
   }
 
-  tmp = get_param_ptr(TOPLEVEL_CONF, "TimesGMT", FALSE);
-  if (tmp != NULL) {
-    list_times_gmt = *tmp;
+  ptr = get_param_ptr(TOPLEVEL_CONF, "TimesGMT", FALSE);
+  if (ptr != NULL) {
+    list_times_gmt = *ptr;
   }
 
   opt_C = opt_d = opt_F = opt_R = 0;
   opt_a = opt_l = opt_STAT = 1;
 
-  pr_fs_clear_cache2(arg && *arg ? arg : ".");
-  res = pr_fsio_stat(arg && *arg ? arg : ".", &st);
+  path = (arg && *arg) ? arg : ".";
+
+  pr_fs_clear_cache2(path);
+  if (list_show_symlinks) {
+    res = pr_fsio_lstat(path, &st);
+
+  } else {
+    res = pr_fsio_stat(path, &st);
+  }
+
   if (res < 0) {
     int xerrno = errno;
 
-    pr_response_add_err(R_450, "%s: %s", arg && *arg ? arg : ".",
-      strerror(xerrno));
+    pr_response_add_err(R_450, "%s: %s", path, strerror(xerrno));
 
     pr_cmd_set_errno(cmd, xerrno);
     errno = xerrno;
@@ -2776,10 +2835,9 @@ MODRET ls_stat(cmd_rec *cmd) {
     resp_code = R_213;
   }
 
-  pr_response_add(resp_code, _("Status of %s:"), arg && *arg ?
-    pr_fs_encode_path(cmd->tmp_pool, arg) :
-    pr_fs_encode_path(cmd->tmp_pool, "."));
-  res = dolist(cmd, arg && *arg ? arg : ".", resp_code, FALSE);
+  pr_response_add(resp_code, _("Status of %s:"),
+    pr_fs_encode_path(cmd->tmp_pool, path));
+  res = dolist(cmd, path, resp_code, FALSE);
   pr_response_add(resp_code, _("End of status"));
   return (res == -1 ? PR_ERROR(cmd) : PR_HANDLED(cmd));
 }
@@ -2999,6 +3057,9 @@ MODRET ls_nlst(cmd_rec *cmd) {
             if (pr_data_open(NULL, "file list", PR_NETIO_IO_WR, 0) < 0) {
               int xerrno = errno;
 
+              pr_response_add_err(R_450, "%s: %s", (char *) cmd->argv[0], 
+                strerror(xerrno));
+
               pr_cmd_set_errno(cmd, xerrno);
               errno = xerrno;
               return PR_ERROR(cmd);
@@ -3023,6 +3084,9 @@ MODRET ls_nlst(cmd_rec *cmd) {
           if (pr_data_open(NULL, "file list", PR_NETIO_IO_WR, 0) < 0) {
             int xerrno = errno;
 
+            pr_response_add_err(R_450, "%s: %s", (char *) cmd->argv[0],
+              strerror(xerrno));
+
             pr_cmd_set_errno(cmd, xerrno);
             errno = xerrno;
             return PR_ERROR(cmd);
@@ -3045,6 +3109,9 @@ MODRET ls_nlst(cmd_rec *cmd) {
 
     if (pr_data_open(NULL, "file list", PR_NETIO_IO_WR, 0) < 0) {
       int xerrno = errno;
+
+      pr_response_add_err(R_450, "%s: %s", (char *) cmd->argv[0],
+        strerror(xerrno));
 
       pr_cmd_set_errno(cmd, xerrno);
       errno = xerrno;
@@ -3136,6 +3203,9 @@ MODRET ls_nlst(cmd_rec *cmd) {
         if (pr_data_open(NULL, "file list", PR_NETIO_IO_WR, 0) < 0) {
           xerrno = errno;
 
+          pr_response_add_err(R_450, "%s: %s", (char *) cmd->argv[0],
+            strerror(xerrno));
+
           pr_cmd_set_errno(cmd, xerrno);
           errno = xerrno;
           return PR_ERROR(cmd);
@@ -3169,6 +3239,9 @@ MODRET ls_nlst(cmd_rec *cmd) {
           if (list_flags & LS_FL_NO_ERROR_IF_ABSENT) {
             if (pr_data_open(NULL, "file list", PR_NETIO_IO_WR, 0) < 0) {
               xerrno = errno;
+
+              pr_response_add_err(R_450, "%s: %s", (char *) cmd->argv[0],
+                strerror(xerrno));
 
               pr_cmd_set_errno(cmd, xerrno);
               errno = xerrno;
@@ -3208,6 +3281,9 @@ MODRET ls_nlst(cmd_rec *cmd) {
         if (pr_data_open(NULL, "file list", PR_NETIO_IO_WR, 0) < 0) {
           xerrno = errno;
 
+          pr_response_add_err(R_450, "%s: %s", (char *) cmd->argv[0],
+            strerror(xerrno));
+
           pr_cmd_set_errno(cmd, xerrno);
           errno = xerrno;
           return PR_ERROR(cmd);
@@ -3228,6 +3304,13 @@ MODRET ls_nlst(cmd_rec *cmd) {
 
     if (S_ISREG(st.st_mode)) {
       if (pr_data_open(NULL, "file list", PR_NETIO_IO_WR, 0) < 0) {
+        int xerrno = errno;
+
+        pr_response_add_err(R_450, "%s: %s", (char *) cmd->argv[0],
+          strerror(xerrno));
+
+        pr_cmd_set_errno(cmd, xerrno);
+        errno = xerrno;
         return PR_ERROR(cmd);
       }
       session.sf_flags |= SF_ASCII_OVERRIDE;
@@ -3352,8 +3435,9 @@ MODRET set_listoptions(cmd_rec *cmd) {
   config_rec *c = NULL;
   unsigned long flags = 0;
 
-  if (cmd->argc-1 < 1)
+  if (cmd->argc-1 < 1) {
     CONF_ERROR(cmd, "wrong number of parameters");
+  }
 
   CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL|CONF_ANON|
     CONF_DIR|CONF_DYNDIR);
@@ -3432,6 +3516,9 @@ MODRET set_listoptions(cmd_rec *cmd) {
 
       } else if (strcasecmp(cmd->argv[i], "NoErrorIfAbsent") == 0) {
         flags |= LS_FL_NO_ERROR_IF_ABSENT;
+
+      } else if (strcasecmp(cmd->argv[i], "NoAdjustedSymlinks") == 0) {
+        flags |= LS_FL_NO_ADJUSTED_SYMLINKS;
 
       } else {
         CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, ": unknown keyword: '",

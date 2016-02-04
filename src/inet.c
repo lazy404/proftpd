@@ -123,6 +123,12 @@ conn_t *pr_inet_copy_conn(pool *p, conn_t *c) {
   conn_t *res = NULL;
   pool *sub_pool = NULL;
 
+  if (p == NULL ||
+      c == NULL) {
+    errno = EINVAL;
+    return NULL;
+  }
+
   sub_pool = make_sub_pool(p);
   pr_pool_tag(sub_pool, "inet_copy_conn pool");
 
@@ -246,7 +252,7 @@ static conn_t *init_conn(pool *p, int fd, pr_netaddr_t *bind_addr,
     defined(__OpenBSD__) || defined(__NetBSD__) || \
     defined(DARWIN6) || defined(DARWIN7) || defined(DARWIN8) || \
     defined(DARWIN9) || defined(DARWIN10) || defined(DARWIN11) || \
-    defined(DARWIN12) || \
+    defined(DARWIN12) || defined(DARWIN13) || defined(DARWIN14) || \
     defined(SCO3) || defined(CYGWIN) || defined(SYSV4_2MP) || \
     defined(SYSV5SCO_SV6) || defined(SYSV5UNIXWARE7)
 # ifdef SOLARIS2
@@ -271,7 +277,7 @@ static conn_t *init_conn(pool *p, int fd, pr_netaddr_t *bind_addr,
     defined(__OpenBSD__) || defined(__NetBSD__) || \
     defined(DARWIN6) || defined(DARWIN7) || defined(DARWIN8) || \
     defined(DARWIN9) || defined(DARWIN10) || defined(DARWIN11) || \
-    defined(DARWIN12) || \
+    defined(DARWIN12) || defined(DARWIN13) || defined(DARWIN14) || \
     defined(SCO3) || defined(CYGWIN) || defined(SYSV4_2MP) || \
     defined(SYSV5SCO_SV6) || defined(SYSV5UNIXWARE7)
 # ifdef SOLARIS2
@@ -519,6 +525,17 @@ conn_t *pr_inet_create_conn_portrange(pool *p, pr_netaddr_t *bind_addr,
   int attempt, random_index;
   conn_t *c = NULL;
 
+  if (low_port < 0 ||
+      high_port < 0) {
+    errno = EINVAL;
+    return NULL;
+  }
+
+  if (low_port >= high_port) {
+    errno = EPERM;
+    return NULL;
+  }
+
   /* Make sure the temporary inet work pool exists. */
   if (!inet_pool) {
     inet_pool = make_sub_pool(permanent_pool); 
@@ -530,16 +547,15 @@ conn_t *pr_inet_create_conn_portrange(pool *p, pr_netaddr_t *bind_addr,
   ports = (int *) pcalloc(inet_pool, range_len * sizeof(int));
 
   i = range_len;
-  while (i--)
+  while (i--) {
     range[i] = low_port + i;
+  }
 
   for (attempt = 3; attempt > 0 && !c; attempt--) {
     for (i = range_len - 1; i >= 0 && !c; i--) {
-
       /* If this is the first attempt through the range, randomize
        * the order of the port numbers used.
        */
-
       if (attempt == 3) {
 	/* Obtain a random index into the port array range. */
 	random_index = (int) ((1.0 * i * rand()) / (RAND_MAX+1.0));
@@ -552,7 +568,6 @@ conn_t *pr_inet_create_conn_portrange(pool *p, pr_netaddr_t *bind_addr,
 	/* Move non-selected numbers down so that the next randomly chosen
 	 * port will be from the range of as-yet untried ports.
 	 */
-
 	while (++random_index <= i) {
 	  range[random_index-1] = range[random_index];
         }
@@ -592,6 +607,10 @@ void pr_inet_close(pool *p, conn_t *c) {
 
 /* Perform shutdown/read on streams */
 void pr_inet_lingering_close(pool *p, conn_t *c, long linger) {
+  if (c == NULL) {
+    return;
+  }
+
   (void) pr_inet_set_block(p, c);
 
   if (c->outstrm) {
@@ -613,6 +632,10 @@ void pr_inet_lingering_close(pool *p, conn_t *c, long linger) {
 
 /* Similar to a lingering close, perform a lingering abort. */
 void pr_inet_lingering_abort(pool *p, conn_t *c, long linger) {
+  if (c == NULL) {
+    return;
+  }
+
   (void) pr_inet_set_block(p, c);
 
   if (c->instrm) {
@@ -626,8 +649,9 @@ void pr_inet_lingering_abort(pool *p, conn_t *c, long linger) {
    * since doing so would result in two 426 responses sent; we only
    * want and need one.
    */
-  if (c->outstrm != c->instrm)
+  if (c->outstrm != c->instrm) {
     pr_netio_close(c->outstrm);
+  }
 
   c->instrm = NULL;
   c->outstrm = NULL;
@@ -675,10 +699,16 @@ int pr_inet_set_proto_nodelay(pool *p, conn_t *conn, int nodelay) {
   int tcp_level = tcp_proto;
 # endif /* SOL_TCP */
 
+  if (conn == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
   if (conn->rfd != -1) {
     res = setsockopt(conn->rfd, tcp_level, TCP_NODELAY, (void *) &nodelay,
       sizeof(nodelay));
-    if (res < 0) {
+    if (res < 0 &&
+        errno != EBADF) {
       pr_log_pri(PR_LOG_NOTICE, "error setting read fd %d TCP_NODELAY %d: %s",
        conn->rfd, nodelay, strerror(errno));
     }
@@ -687,7 +717,8 @@ int pr_inet_set_proto_nodelay(pool *p, conn_t *conn, int nodelay) {
   if (conn->wfd != -1) {
     res = setsockopt(conn->wfd, tcp_level, TCP_NODELAY, (void *) &nodelay,
       sizeof(nodelay));
-    if (res < 0) {
+    if (res < 0 &&
+        errno != EBADF) {
       pr_log_pri(PR_LOG_NOTICE, "error setting write fd %d TCP_NODELAY %d: %s",
        conn->wfd, nodelay, strerror(errno));
     }
@@ -717,39 +748,54 @@ int pr_inet_set_proto_opts(pool *p, conn_t *c, int mss, int nodelay,
 #else
   int tcp_level = tcp_proto;
 #endif /* SOL_TCP */
+  unsigned char *no_delay = NULL;
 
   /* Some of these setsockopt() calls may fail when they operate on IPv6
    * sockets, rather than on IPv4 sockets.
    */
 
+  if (c == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
 #ifdef TCP_NODELAY
-  unsigned char *no_delay = get_param_ptr(main_server->conf, "tcpNoDelay",
-    FALSE);
 
-  if (!no_delay ||
+  /* Note: main_server might be null when those code runs in the testsuite. */
+  if (main_server != NULL) {
+    no_delay = get_param_ptr(main_server->conf, "tcpNoDelay", FALSE);
+  }
+
+  if (no_delay == NULL ||
       *no_delay == TRUE) {
-
     if (c->rfd != -1) {
       if (setsockopt(c->rfd, tcp_level, TCP_NODELAY, (void *) &nodelay,
           sizeof(nodelay)) < 0) {
-        pr_log_pri(PR_LOG_NOTICE, "error setting read fd %d TCP_NODELAY: %s",
-          c->rfd, strerror(errno));
+        if (errno != EBADF) {
+          pr_log_pri(PR_LOG_NOTICE, "error setting read fd %d TCP_NODELAY: %s",
+            c->rfd, strerror(errno));
+        }
       }
     }
 
     if (c->wfd != -1) {
       if (setsockopt(c->wfd, tcp_level, TCP_NODELAY, (void *) &nodelay,
           sizeof(nodelay)) < 0) {
-        pr_log_pri(PR_LOG_NOTICE, "error setting write fd %d TCP_NODELAY: %s",
-          c->wfd, strerror(errno));
+        if (errno != EBADF) {
+          pr_log_pri(PR_LOG_NOTICE, "error setting write fd %d TCP_NODELAY: %s",
+            c->wfd, strerror(errno));
+        }
       }
     }
 
     if (c->listen_fd != -1) {
       if (setsockopt(c->listen_fd, tcp_level, TCP_NODELAY, (void *) &nodelay,
           sizeof(nodelay)) < 0) {
-        pr_log_pri(PR_LOG_NOTICE, "error setting listen fd %d TCP_NODELAY: %s",
-          c->listen_fd, strerror(errno));
+        if (errno != EBADF) {
+          pr_log_pri(PR_LOG_NOTICE,
+            "error setting listen fd %d TCP_NODELAY: %s",
+            c->listen_fd, strerror(errno));
+        }
       }
     }
   }
@@ -757,7 +803,7 @@ int pr_inet_set_proto_opts(pool *p, conn_t *c, int mss, int nodelay,
 
 #ifdef TCP_MAXSEG
   if (c->listen_fd != -1 &&
-      mss) {
+      mss > 0) {
     if (setsockopt(c->listen_fd, tcp_level, TCP_MAXSEG, &mss,
         sizeof(mss)) < 0) {
       pr_log_pri(PR_LOG_NOTICE, "error setting listen fd TCP_MAXSEG(%d): %s",
@@ -816,6 +862,11 @@ int pr_inet_set_proto_opts(pool *p, conn_t *c, int mss, int nodelay,
 /* Set socket options on a connection.  */
 int pr_inet_set_socket_opts(pool *p, conn_t *c, int rcvbuf, int sndbuf,
     struct tcp_keepalive *tcp_keepalive) {
+
+  if (c == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
 
   /* Linux and "most" newer networking OSes probably use a highly adaptive
    * window size system, which generally wouldn't require user-space
@@ -1134,14 +1185,20 @@ int pr_inet_set_block(pool *p, conn_t *c) {
   return res;
 }
 
-/* Put a connection in listen mode
- */
+/* Put a connection in listen mode */
 int pr_inet_listen(pool *p, conn_t *c, int backlog, int flags) {
-  if (!c || c->mode == CM_LISTEN)
+  if (c == NULL) {
+    errno = EINVAL;
     return -1;
+  }
+
+  if (c->mode == CM_LISTEN) {
+    errno = EPERM;
+    return -1;
+  }
 
   while (TRUE) {
-    if (listen(c->listen_fd, backlog) == -1) {
+    if (listen(c->listen_fd, backlog) < 0) {
       int xerrno = errno;
 
       if (xerrno == EINTR) {
@@ -1158,10 +1215,9 @@ int pr_inet_listen(pool *p, conn_t *c, int backlog, int flags) {
 
       errno = xerrno;
       return -1;
-
-    } else {
-      break;
     }
+
+    break;
   }
 
   c->mode = CM_LISTEN;
@@ -1172,6 +1228,11 @@ int pr_inet_listen(pool *p, conn_t *c, int backlog, int flags) {
  * for safety.
  */
 int pr_inet_resetlisten(pool *p, conn_t *c) {
+  if (c == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
   c->mode = CM_LISTEN;
   if (pr_inet_set_block(c->pool, c) < 0) {
     c->xerrno = errno;
@@ -1184,6 +1245,12 @@ int pr_inet_resetlisten(pool *p, conn_t *c) {
 int pr_inet_connect(pool *p, conn_t *c, pr_netaddr_t *addr, int port) {
   pr_netaddr_t remote_na;
   int res = 0;
+
+  if (c == NULL ||
+      addr == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
 
   c->mode = CM_CONNECT;
   if (pr_inet_set_block(p, c) < 0) {
@@ -1235,6 +1302,12 @@ int pr_inet_connect(pool *p, conn_t *c, pr_netaddr_t *addr, int port) {
 int pr_inet_connect_nowait(pool *p, conn_t *c, pr_netaddr_t *addr, int port) {
   pr_netaddr_t remote_na;
 
+  if (c == NULL ||
+      addr == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
   c->mode = CM_CONNECT;
   if (pr_inet_set_nonblock(p, c) < 0) {
     c->mode = CM_ERROR;
@@ -1251,7 +1324,8 @@ int pr_inet_connect_nowait(pool *p, conn_t *c, pr_netaddr_t *addr, int port) {
 
   if (connect(c->listen_fd, pr_netaddr_get_sockaddr(&remote_na),
       pr_netaddr_get_sockaddr_len(&remote_na)) == -1) {
-    if (errno != EINPROGRESS && errno != EALREADY) {
+    if (errno != EINPROGRESS &&
+        errno != EALREADY) {
       c->mode = CM_ERROR;
       c->xerrno = errno;
 
@@ -1290,6 +1364,11 @@ int pr_inet_connect_nowait(pool *p, conn_t *c, pr_netaddr_t *addr, int port) {
  */
 int pr_inet_accept_nowait(pool *p, conn_t *c) {
   int fd;
+
+  if (c == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
 
   if (c->mode == CM_LISTEN) {
     if (pr_inet_set_nonblock(c->pool, c) < 0) {
@@ -1350,9 +1429,14 @@ conn_t *pr_inet_accept(pool *p, conn_t *d, conn_t *c, int rfd, int wfd,
   conn_t *res = NULL;
   unsigned char *allow_foreign_addr = NULL;
   int fd = -1;
-
   pr_netaddr_t na;
   socklen_t nalen;
+
+  if (c == NULL ||
+      d == NULL) {
+    errno = EINVAL;
+    return NULL;
+  }
 
   /* Initialize the netaddr. */
   pr_netaddr_clear(&na);
@@ -1409,7 +1493,11 @@ int pr_inet_get_conn_info(conn_t *c, int fd) {
   pr_netaddr_t na;
   socklen_t nalen;
 
-  /* Sanity check. */
+  if (c == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
   if (fd < 0) {
     errno = EBADF;
     return -1;
@@ -1670,7 +1758,6 @@ int pr_inet_generate_socket_event(const char *event, server_rec *s,
 
   return 0;
 }
-
 
 void init_inet(void) {
   struct protoent *pr = NULL;

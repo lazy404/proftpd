@@ -2,7 +2,7 @@
  * ProFTPD - FTP server daemon
  * Copyright (c) 1997, 1998 Public Flood Software
  * Copyright (c) 1999, 2000 MacGyver aka Habeeb J. Dihu <macgyver@tos.net>
- * Copyright (c) 2001-2015 The ProFTPD Project team
+ * Copyright (c) 2001-2016 The ProFTPD Project team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -1140,7 +1140,7 @@ static int get_hidden_store_path(cmd_rec *cmd, char *path, char *prefix,
       hidden_path, path);
   }
 
-  if (file_mode(hidden_path)) {
+  if (file_mode2(cmd->tmp_pool, hidden_path)) {
     session.xfer.xfer_type = STOR_DEFAULT;
 
     pr_log_debug(DEBUG3, "HiddenStore path '%s' already exists",
@@ -1219,6 +1219,7 @@ MODRET xfer_pre_stor(cmd_rec *cmd) {
   unsigned char *allow_overwrite = NULL, *allow_restart = NULL;
   config_rec *c;
   int res;
+  struct stat st;
 
   if (cmd->argc < 2) {
     pr_response_add_err(R_500, _("'%s' not understood"),
@@ -1244,9 +1245,24 @@ MODRET xfer_pre_stor(cmd_rec *cmd) {
     return PR_ERROR(cmd);
   }
 
+  if (pr_fsio_lstat(decoded_path, &st) == 0) {
+    if (S_ISLNK(st.st_mode)) {
+      char buf[PR_TUNABLE_PATH_MAX];
+      int len;
+
+      memset(buf, '\0', sizeof(buf));
+      len = dir_readlink(cmd->tmp_pool, decoded_path, buf, sizeof(buf)-1,
+        PR_DIR_READLINK_FL_HANDLE_REL_PATH);
+      if (len > 0) {
+        buf[len] = '\0';
+        decoded_path = pstrdup(cmd->tmp_pool, buf);
+      }
+    }
+  }
+
   path = dir_best_path(cmd->tmp_pool, decoded_path);
 
-  if (!path ||
+  if (path == NULL ||
       !dir_check(cmd->tmp_pool, cmd, cmd->group, path, NULL)) {
     int xerrno = errno;
 
@@ -1291,7 +1307,7 @@ MODRET xfer_pre_stor(cmd_rec *cmd) {
     return PR_ERROR(cmd);
   }
 
-  fmode = file_mode(path);
+  fmode = file_mode2(cmd->tmp_pool, path);
 
   allow_overwrite = get_param_ptr(CURRENT_CONF, "AllowOverwrite", FALSE);
 
@@ -1444,7 +1460,7 @@ MODRET xfer_pre_stor(cmd_rec *cmd) {
 MODRET xfer_pre_stou(cmd_rec *cmd) {
   config_rec *c = NULL;
   char *prefix = "ftp", *filename = NULL;
-  int tmpfd;
+  int stou_fd;
   mode_t mode;
   unsigned char *allow_overwrite = NULL;
 
@@ -1488,16 +1504,17 @@ MODRET xfer_pre_stou(cmd_rec *cmd) {
    * unique filename prefix.
    */
   c = find_config(CURRENT_CONF, CONF_PARAM, "StoreUniquePrefix", FALSE);
-  if (c != NULL)
+  if (c != NULL) {
     prefix = c->argv[0];
+  }
 
   /* Now, construct the unique filename using the cmd_rec's pool, the
    * prefix, and mkstemp().
    */
   filename = pstrcat(cmd->pool, prefix, "XXXXXX", NULL);
 
-  tmpfd = mkstemp(filename);
-  if (tmpfd < 0) {
+  stou_fd = mkstemp(filename);
+  if (stou_fd < 0) {
     int xerrno = errno;
 
     pr_log_pri(PR_LOG_WARNING, "error: unable to use mkstemp(): %s",
@@ -1510,22 +1527,20 @@ MODRET xfer_pre_stou(cmd_rec *cmd) {
     pr_cmd_set_errno(cmd, xerrno);
     errno = xerrno;
     return PR_ERROR(cmd);
-
-  } else {
-    cmd->arg = filename;
-
-    /* Close the unique file.  This introduces a small race condition
-     * between the time this function returns, and the STOU CMD handler
-     * opens the unique file, but this may have to do, as closing that
-     * race would involve some major restructuring.
-     */
-    (void) close(tmpfd);
   }
 
-  /* It's OK to reuse the char * pointer for filename. */
+  cmd->arg = filename;
+
+  /* Close the unique file.  This introduces a small race condition
+   * between the time this function returns, and the STOU CMD handler
+   * opens the unique file, but this may have to do, as closing that
+   * race would involve some major restructuring.
+   */
+  (void) close(stou_fd);
+
   filename = dir_best_path(cmd->tmp_pool, cmd->arg);
 
-  if (!filename ||
+  if (filename == NULL ||
       !dir_check(cmd->tmp_pool, cmd, cmd->group, filename, NULL)) {
     int xerrno = errno;
 
@@ -1541,7 +1556,7 @@ MODRET xfer_pre_stou(cmd_rec *cmd) {
     return PR_ERROR(cmd);
   }
 
-  mode = file_mode(filename);
+  mode = file_mode2(cmd->tmp_pool, filename);
 
   /* Note: this case should never happen: how one can be appending to
    * a supposedly unique filename?  Should probably be removed...
@@ -1585,23 +1600,61 @@ MODRET xfer_pre_stou(cmd_rec *cmd) {
   return PR_HANDLED(cmd);
 }
 
+MODRET xfer_post_stor(cmd_rec *cmd) {
+  char *path;
+
+  path = pr_table_get(cmd->notes, "mod_xfer.store-path", NULL);
+  if (path != NULL) {
+    struct stat st;
+
+    if (pr_fsio_stat(path, &st) == 0) {
+      off_t *file_size;
+
+      file_size = palloc(cmd->pool, sizeof(off_t));
+      *file_size = st.st_size;
+      (void) pr_table_add(cmd->notes, "mod_xfer.file-size", file_size,
+        sizeof(off_t));
+    }
+  }
+
+  return PR_DECLINED(cmd);
+}
+
 /* xfer_post_stou() is a POST_CMD handler that changes the mode of the
- * STOU file from 0600, which is what mkstemp() makes it, to 0666,
- * the default for files uploaded via STOR.  This is to prevent users
+ * STOU file from 0600, which is what mkstemp() makes it, to 0666 (modulo
+ * Umask), the default for files uploaded via STOR.  This is to prevent users
  * from being surprised.
  */
 MODRET xfer_post_stou(cmd_rec *cmd) {
+  mode_t mask, perms, *umask;
+  struct stat st;
 
-  /* This is the same mode as used in src/fs.c.  Should probably be
-   * available as a macro.
+  /* mkstemp(3) creates a file with 0600 perms; we need to adjust this
+   * for the Umask (Bug#4223).
    */
-  mode_t mode = 0666;
+  umask = get_param_ptr(CURRENT_CONF, "Umask", FALSE);
+  if (umask != NULL) {
+    mask = *umask;
 
-  if (pr_fsio_chmod(cmd->arg, mode) < 0) {
+  } else {
+    mask = (mode_t) 0022;
+  }
 
+  perms = (0666 & ~mask);
+
+  if (pr_fsio_chmod(cmd->arg, perms) < 0) {
     /* Not much to do but log the error. */
     pr_log_pri(PR_LOG_NOTICE, "error: unable to chmod '%s' to %04o: %s",
-      cmd->arg, mode, strerror(errno));
+      cmd->arg, perms, strerror(errno));
+  }
+
+  if (pr_fsio_stat(cmd->arg, &st) == 0) {
+    off_t *file_size;
+
+    file_size = palloc(cmd->pool, sizeof(off_t));
+    *file_size = st.st_size;
+    (void) pr_table_add(cmd->notes, "mod_xfer.file-size", file_size,
+      sizeof(off_t));
   }
 
   return PR_DECLINED(cmd);
@@ -1626,9 +1679,8 @@ MODRET xfer_pre_appe(cmd_rec *cmd) {
 }
 
 MODRET xfer_stor(cmd_rec *cmd) {
-  char *path;
-  char *lbuf;
-  int bufsz, len, ferrno = 0, res;
+  char *path, *lbuf;
+  int bufsz, len, xerrno = 0, res;
   off_t nbytes_stored, nbytes_max_store = 0;
   unsigned char have_limit = FALSE;
   struct stat st;
@@ -1675,19 +1727,38 @@ MODRET xfer_stor(cmd_rec *cmd) {
 
     stor_fh = pr_fsio_open(session.xfer.path_hidden, oflags);
     if (stor_fh == NULL) {
-      ferrno = errno;
+      xerrno = errno;
 
       (void) pr_trace_msg("fileperms", 1, "%s, user '%s' (UID %s, GID %s): "
         "error opening '%s': %s", (char *) cmd->argv[0], session.user,
         pr_uid2str(cmd->tmp_pool, session.uid),
         pr_gid2str(cmd->tmp_pool, session.gid), session.xfer.path_hidden,
-        strerror(ferrno));
+        strerror(xerrno));
     }
 
   } else if (session.xfer.xfer_type == STOR_APPEND) {
-    stor_fh = pr_fsio_open(session.xfer.path, O_CREAT|O_WRONLY);
+    char *appe_path;
 
-    if (stor_fh) {
+    /* Need to handle the case where the path may be a symlink, and we are
+     * chrooted (Bug#4219).
+     */
+    appe_path = session.xfer.path;
+    if (pr_fsio_lstat(appe_path, &st) == 0) {
+      if (S_ISLNK(st.st_mode)) {
+        char buf[PR_TUNABLE_PATH_MAX];
+
+        memset(buf, '\0', sizeof(buf));
+        len = dir_readlink(cmd->tmp_pool, appe_path, buf, sizeof(buf)-1,
+          PR_DIR_READLINK_FL_HANDLE_REL_PATH);
+        if (len > 0) {
+          buf[len] = '\0';
+          appe_path = pstrdup(cmd->pool, buf);
+        }
+      }
+    }
+
+    stor_fh = pr_fsio_open(appe_path, O_CREAT|O_WRONLY);
+    if (stor_fh != NULL) {
       if (pr_fsio_lseek(stor_fh, 0, SEEK_END) == (off_t) -1) {
         pr_log_debug(DEBUG4, "unable to seek to end of '%s' for appending: %s",
           cmd->arg, strerror(errno));
@@ -1696,13 +1767,12 @@ MODRET xfer_stor(cmd_rec *cmd) {
       }
 
     } else {
-      ferrno = errno;
+      xerrno = errno;
 
       (void) pr_trace_msg("fileperms", 1, "%s, user '%s' (UID %s, GID %s): "
         "error opening '%s': %s", (char *) cmd->argv[0], session.user,
         pr_uid2str(cmd->tmp_pool, session.uid),
-        pr_gid2str(cmd->tmp_pool, session.gid), session.xfer.path,
-        strerror(ferrno));
+        pr_gid2str(cmd->tmp_pool, session.gid), appe_path, strerror(xerrno));
     }
 
   } else {
@@ -1710,18 +1780,18 @@ MODRET xfer_stor(cmd_rec *cmd) {
     stor_fh = pr_fsio_open(path,
         O_WRONLY|(session.restart_pos ? 0 : O_TRUNC|O_CREAT));
     if (stor_fh == NULL) {
-      ferrno = errno;
+      xerrno = errno;
 
       (void) pr_trace_msg("fileperms", 1, "%s, user '%s' (UID %s, GID %s): "
         "error opening '%s': %s", (char *) cmd->argv[0], session.user,
         pr_uid2str(cmd->tmp_pool, session.uid),
-        pr_gid2str(cmd->tmp_pool, session.gid), path, strerror(ferrno));
+        pr_gid2str(cmd->tmp_pool, session.gid), path, strerror(xerrno));
     }
   }
 
   if (stor_fh != NULL &&
       session.restart_pos) {
-    int xerrno = 0;
+    xerrno = 0;
 
     pr_fs_clear_cache2(path);
     if (pr_fsio_lseek(stor_fh, session.restart_pos, SEEK_SET) == -1) {
@@ -1761,11 +1831,11 @@ MODRET xfer_stor(cmd_rec *cmd) {
 
   if (stor_fh == NULL) {
     pr_log_debug(DEBUG4, "unable to open '%s' for writing: %s", cmd->arg,
-      strerror(ferrno));
-    pr_response_add_err(R_550, "%s: %s", cmd->arg, strerror(ferrno));
+      strerror(xerrno));
+    pr_response_add_err(R_550, "%s: %s", cmd->arg, strerror(xerrno));
 
-    pr_cmd_set_errno(cmd, ferrno);
-    errno = ferrno;
+    pr_cmd_set_errno(cmd, xerrno);
+    errno = xerrno;
     return PR_ERROR(cmd);
   }
 
@@ -1810,7 +1880,7 @@ MODRET xfer_stor(cmd_rec *cmd) {
   stor_chown(cmd->tmp_pool);
 
   if (pr_data_open(cmd->arg, NULL, PR_NETIO_IO_RD, 0) < 0) {
-    int xerrno = errno;
+    xerrno = errno;
 
     stor_abort();
     pr_data_abort(0, TRUE);
@@ -1855,8 +1925,6 @@ MODRET xfer_stor(cmd_rec *cmd) {
      */
     if (have_limit &&
         (nbytes_stored + st.st_size > nbytes_max_store)) {
-      int xerrno;
-
       pr_log_pri(PR_LOG_NOTICE, "MaxStoreFileSize (%" PR_LU " bytes) reached: "
         "aborting transfer of '%s'", (pr_off_t) nbytes_max_store, path);
 
@@ -1885,7 +1953,7 @@ MODRET xfer_stor(cmd_rec *cmd) {
      */
     res = pr_fsio_write(stor_fh, lbuf, len);
     if (res != len) {
-      int xerrno = EIO;
+      xerrno = EIO;
 
       if (res < 0) {
         xerrno = errno;
@@ -1920,7 +1988,7 @@ MODRET xfer_stor(cmd_rec *cmd) {
   } else if (len < 0) {
 
     /* default abort errno, in case session.d et al has already gone away */
-    int xerrno = ECONNABORTED;
+    xerrno = ECONNABORTED;
 
     stor_abort();
 
@@ -1940,7 +2008,7 @@ MODRET xfer_stor(cmd_rec *cmd) {
     pr_throttle_pause(nbytes_stored, TRUE);
 
     if (stor_complete() < 0) {
-      int xerrno = errno;
+      xerrno = errno;
 
       _log_transfer('i', 'i');
 
@@ -1977,7 +2045,7 @@ MODRET xfer_stor(cmd_rec *cmd) {
     if (session.xfer.path &&
         session.xfer.path_hidden) {
       if (pr_fsio_rename(session.xfer.path_hidden, session.xfer.path) < 0) {
-        int xerrno = errno;
+        xerrno = errno;
 
         /* This should only fail on a race condition with a chmod/chown
          * or if STOR_APPEND is on and the permissions are squirrely.
@@ -2097,6 +2165,7 @@ MODRET xfer_pre_retr(cmd_rec *cmd) {
   mode_t fmode;
   unsigned char *allow_restart = NULL;
   config_rec *c;
+  struct stat st;
 
   xfer_logged_sendfile_decline_msg = FALSE;
 
@@ -2124,9 +2193,31 @@ MODRET xfer_pre_retr(cmd_rec *cmd) {
     return PR_ERROR(cmd);
   }
 
-  dir = dir_realpath(cmd->tmp_pool, decoded_path);
+  if (pr_fsio_lstat(decoded_path, &st) == 0) {
+    if (S_ISLNK(st.st_mode)) {
+      char buf[PR_TUNABLE_PATH_MAX];
+      int len;
 
-  if (!dir ||
+      memset(buf, '\0', sizeof(buf));
+      len = dir_readlink(cmd->tmp_pool, decoded_path, buf, sizeof(buf)-1,
+        PR_DIR_READLINK_FL_HANDLE_REL_PATH);
+      if (len > 0) {
+        buf[len] = '\0';
+        dir = pstrdup(cmd->tmp_pool, buf);
+
+      } else {
+        dir = dir_realpath(cmd->tmp_pool, decoded_path);
+      }
+
+    } else {
+      dir = dir_realpath(cmd->tmp_pool, decoded_path);
+    }
+
+  } else {
+    dir = dir_realpath(cmd->tmp_pool, decoded_path);
+  }
+
+  if (dir == NULL ||
       !dir_check(cmd->tmp_pool, cmd, cmd->group, dir, NULL)) {
     int xerrno = errno;
 
@@ -2157,7 +2248,7 @@ MODRET xfer_pre_retr(cmd_rec *cmd) {
     return PR_ERROR(cmd);
   }
 
-  fmode = file_mode(dir);
+  fmode = file_mode2(cmd->tmp_pool, dir);
   if (fmode == 0) {
     int xerrno = errno;
 
@@ -2208,6 +2299,26 @@ MODRET xfer_pre_retr(cmd_rec *cmd) {
 
   (void) xfer_prio_adjust();
   return PR_HANDLED(cmd);
+}
+
+MODRET xfer_post_retr(cmd_rec *cmd) {
+  char *path;
+
+  path = pr_table_get(cmd->notes, "mod_xfer.retr-path", NULL);
+  if (path != NULL) {
+    struct stat st;
+
+    if (pr_fsio_stat(path, &st) == 0) {
+      off_t *file_size;
+
+      file_size = palloc(cmd->pool, sizeof(off_t));
+      *file_size = st.st_size;
+      (void) pr_table_add(cmd->notes, "mod_xfer.file-size", file_size,
+        sizeof(off_t));
+    }
+  }
+
+  return PR_DECLINED(cmd);
 }
 
 MODRET xfer_retr(cmd_rec *cmd) {
@@ -2434,6 +2545,7 @@ MODRET xfer_retr(cmd_rec *cmd) {
     return PR_ERROR(cmd);
 
   } else {
+
     /* If no throttling is configured, this simply updates the scoreboard.
      * In this case, we want to use session.xfer.total_bytes, rather than
      * nbytes_sent, as the latter incorporates a REST position and the
@@ -3826,10 +3938,12 @@ static cmdtable xfer_cmdtab[] = {
   { CMD,     C_SMNT,	G_NONE,	 xfer_smnt,	TRUE,	FALSE, CL_MISC },
   { PRE_CMD, C_RETR,	G_READ,	 xfer_pre_retr,	TRUE,	FALSE },
   { CMD,     C_RETR,	G_READ,	 xfer_retr,	TRUE,	FALSE, CL_READ },
+  { POST_CMD,C_RETR,	G_NONE,  xfer_post_retr,FALSE,	FALSE },
   { LOG_CMD, C_RETR,	G_NONE,	 xfer_log_retr,	FALSE,  FALSE },
   { LOG_CMD_ERR, C_RETR,G_NONE,  xfer_err_cleanup,  FALSE,  FALSE },
   { PRE_CMD, C_STOR,	G_WRITE, xfer_pre_stor,	TRUE,	FALSE },
   { CMD,     C_STOR,	G_WRITE, xfer_stor,	TRUE,	FALSE, CL_WRITE },
+  { POST_CMD,C_STOR,	G_NONE,  xfer_post_stor,FALSE,	FALSE },
   { LOG_CMD, C_STOR,    G_NONE,	 xfer_log_stor,	FALSE,  FALSE },
   { LOG_CMD_ERR, C_STOR,G_NONE,  xfer_err_cleanup,  FALSE,  FALSE },
   { PRE_CMD, C_STOU,	G_WRITE, xfer_pre_stou,	TRUE,	FALSE },
@@ -3839,6 +3953,7 @@ static cmdtable xfer_cmdtab[] = {
   { LOG_CMD_ERR, C_STOU,G_NONE,  xfer_err_cleanup,  FALSE,  FALSE },
   { PRE_CMD, C_APPE,	G_WRITE, xfer_pre_appe,	TRUE,	FALSE },
   { CMD,     C_APPE,	G_WRITE, xfer_stor,	TRUE,	FALSE, CL_WRITE },
+  { POST_CMD,C_APPE,	G_NONE,  xfer_post_stor,FALSE,	FALSE },
   { LOG_CMD, C_APPE,	G_NONE,  xfer_log_stor,	FALSE,  FALSE },
   { LOG_CMD_ERR, C_APPE,G_NONE,  xfer_err_cleanup,  FALSE,  FALSE },
   { CMD,     C_ABOR,	G_NONE,	 xfer_abor,	TRUE,	TRUE,  CL_MISC  },

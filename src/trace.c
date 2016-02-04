@@ -97,8 +97,9 @@ static int trace_write(const char *channel, int level, const char *msg,
   struct tm *tm;
   int use_conn_ips = FALSE;
 
-  if (trace_logfd < 0)
+  if (trace_logfd < 0) {
     return 0;
+  }
 
   memset(buf, '\0', sizeof(buf));
 
@@ -334,9 +335,9 @@ int pr_trace_parse_levels(char *str, int *min_level, int *max_level) {
 }
 
 int pr_trace_set_file(const char *path) {
-  int res;
+  int res, xerrno;
 
-  if (!path) {
+  if (path == NULL) {
     if (trace_logfd < 0) {
       errno = EINVAL;
       return -1;
@@ -350,13 +351,15 @@ int pr_trace_set_file(const char *path) {
   pr_signals_block();
   PRIVS_ROOT
   res = pr_log_openfile(path, &trace_logfd, 0660);
+  xerrno = errno;
   PRIVS_RELINQUISH
   pr_signals_unblock();
 
   if (res < 0) {
     if (res == -1) {
       pr_log_debug(DEBUG1, "unable to open TraceLog '%s': %s", path,
-        strerror(errno));
+        strerror(xerrno));
+      errno = xerrno;
 
     } else if (res == PR_LOG_WRITABLE_DIR) {
       pr_log_debug(DEBUG1,
@@ -378,15 +381,7 @@ int pr_trace_set_file(const char *path) {
 int pr_trace_set_levels(const char *channel, int min_level, int max_level) {
 
   if (channel == NULL) {
-    void *v;
-
     if (trace_tab == NULL) {
-      errno = EINVAL;
-      return -1;
-    }
-
-    v = pr_table_remove(trace_tab, channel, NULL);
-    if (v == NULL) {
       errno = EINVAL;
       return -1;
     }
@@ -477,6 +472,10 @@ int pr_trace_use_stderr(int use_stderr) {
     /* Avoid a file descriptor leak by closing any existing fd. */
     (void) close(trace_logfd);
     trace_logfd = res;
+
+  } else {
+    (void) close(trace_logfd);
+    trace_logfd = -1;
   }
 
   return 0;

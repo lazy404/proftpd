@@ -2,7 +2,7 @@
  * ProFTPD - FTP server daemon
  * Copyright (c) 1997, 1998 Public Flood Software
  * Copyright (c) 1999, 2000 MacGyver aka Habeeb J. Dihu <macgyver@tos.net>
- * Copyright (c) 2001-2015 The ProFTPD Project team
+ * Copyright (c) 2001-2016 The ProFTPD Project team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -363,7 +363,7 @@ MODRET add_include(cmd_rec *cmd) {
       "unable to use path for configuration file '", cmd->argv[1], "'", NULL));
   }
 
-  if (parse_config_path(cmd->tmp_pool, cmd->argv[1]) == -1) {
+  if (parse_config_path(cmd->tmp_pool, cmd->argv[1]) < 0) {
     int xerrno = errno;
 
     if (xerrno != EINVAL) {
@@ -868,6 +868,7 @@ MODRET set_defaultserver(cmd_rec *cmd) {
 
 MODRET set_masqueradeaddress(cmd_rec *cmd) {
   config_rec *c = NULL;
+  const char *name;
   pr_netaddr_t *masq_addr = NULL;
   unsigned int addr_flags = PR_NETADDR_GET_ADDR_FL_INCL_DEVICE;
 
@@ -877,11 +878,18 @@ MODRET set_masqueradeaddress(cmd_rec *cmd) {
   /* We can only masquerade as one address, so we don't need to know if the
    * given name might map to multiple addresses.
    */
-  masq_addr = pr_netaddr_get_addr2(cmd->server->pool, cmd->argv[1], NULL,
-    addr_flags);
+  name = cmd->argv[1];
+  masq_addr = pr_netaddr_get_addr2(cmd->server->pool, name, NULL, addr_flags);
   if (masq_addr == NULL) {
-    return PR_ERROR_MSG(cmd, NULL, pstrcat(cmd->tmp_pool, cmd->argv[0],
-      ": unable to resolve \"", cmd->argv[1], "\"", NULL));
+
+    /* If the requested name cannot be resolved because it is not known AT
+     * THIS TIME, then do not fail to start the server.  We will simply try
+     * again later (Bug#4104).
+     */
+    if (errno != ENOENT) {
+      CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "unable to resolve '", name, "'",
+        NULL));
+    }
   }
 
   c = add_config_param(cmd->argv[0], 2, (void *) masq_addr, NULL);
@@ -891,23 +899,25 @@ MODRET set_masqueradeaddress(cmd_rec *cmd) {
 }
 
 MODRET set_maxinstances(cmd_rec *cmd) {
-  int max;
+  int max_instances;
   char *endp;
 
-  CHECK_ARGS(cmd,1);
-  CHECK_CONF(cmd,CONF_ROOT);
+  CHECK_ARGS(cmd, 1);
+  CHECK_CONF(cmd, CONF_ROOT);
 
-  if (strcasecmp(cmd->argv[1], "none") == 0)
-    max = 0;
+  if (strcasecmp(cmd->argv[1], "none") == 0) {
+    max_instances = 0;
 
-  else {
-    max = (int)strtol(cmd->argv[1], &endp, 10);
+  } else {
+    max_instances = (int) strtol(cmd->argv[1], &endp, 10);
 
-    if ((endp && *endp) || max < 1)
+    if ((endp && *endp) ||
+        max_instances < 1) {
       CONF_ERROR(cmd, "argument must be 'none' or a number greater than 0");
+    }
   }
 
-  ServerMaxInstances = max;
+  ServerMaxInstances = max_instances;
   return PR_HANDLED(cmd);
 }
 
@@ -1379,6 +1389,10 @@ MODRET set_fscachepolicy(cmd_rec *cmd) {
   c = add_config_param_str(cmd->argv[0], 3, NULL, NULL, NULL);
   c->argv[0] = palloc(c->pool, sizeof(int));
   *((int *) c->argv[0]) = TRUE;
+  c->argv[1] = palloc(c->pool, sizeof(unsigned int));
+  *((unsigned int *) c->argv[1]) = PR_TUNABLE_FS_STATCACHE_SIZE;
+  c->argv[2] = palloc(c->pool, sizeof(unsigned int));
+  *((unsigned int *) c->argv[2]) = PR_TUNABLE_FS_STATCACHE_MAX_AGE;
 
   for (i = 1; i < cmd->argc; i++) {
     if (strncasecmp(cmd->argv[i], "size", 5) == 0) {
@@ -1389,7 +1403,6 @@ MODRET set_fscachepolicy(cmd_rec *cmd) {
         CONF_ERROR(cmd, "size parameter must be greater than 1");
       }
 
-      c->argv[1] = palloc(c->pool, sizeof(unsigned int));
       *((unsigned int *) c->argv[1]) = size;
 
     } else if (strncasecmp(cmd->argv[i], "maxAge", 7) == 0) {
@@ -1400,7 +1413,6 @@ MODRET set_fscachepolicy(cmd_rec *cmd) {
         CONF_ERROR(cmd, "maxAge parameter must be greater than 1");
       }
 
-      c->argv[2] = palloc(c->pool, sizeof(unsigned int));
       *((unsigned int *) c->argv[2]) = max_age;
 
     } else {
@@ -3613,14 +3625,18 @@ MODRET core_pasv(cmd_rec *cmd) {
       c = find_config(main_server->conf, CONF_PARAM, "MasqueradeAddress",
         FALSE);
       if (c != NULL) {
-        addrstr = (char *) pr_netaddr_get_ipstr(c->argv[0]);
+        if (c->argv[0] != NULL) {
+          addrstr = (char *) pr_netaddr_get_ipstr(c->argv[0]);
+        }
       }
     }
 
   } else {
     c = find_config(main_server->conf, CONF_PARAM, "MasqueradeAddress", FALSE);
     if (c != NULL) {
-      addrstr = (char *) pr_netaddr_get_ipstr(c->argv[0]);
+      if (c->argv[0] != NULL) {
+        addrstr = (char *) pr_netaddr_get_ipstr(c->argv[0]);
+      }
     }
   }
 
@@ -3700,7 +3716,7 @@ MODRET core_port(cmd_rec *cmd) {
       *root_revoke == 1 &&
       session.c->local_port < 1024) {
     pr_log_debug(DEBUG0, "RootRevoke in effect, unable to bind to local "
-      "port %d for active transfer", session.c->local_port);
+      "port %d for active transfer", session.c->local_port-1);
     pr_response_add_err(R_500, _("Unable to service PORT commands"));
 
     pr_cmd_set_errno(cmd, EPERM);
@@ -3773,14 +3789,18 @@ MODRET core_port(cmd_rec *cmd) {
       c = find_config(main_server->conf, CONF_PARAM, "MasqueradeAddress",
         FALSE);
       if (c != NULL) {
-        listen_addr = c->argv[0];
+        if (c->argv[0] != NULL) {
+          listen_addr = c->argv[0];
+        }
       }
     }
 
   } else {
     c = find_config(main_server->conf, CONF_PARAM, "MasqueradeAddress", FALSE);
     if (c != NULL) {
-      listen_addr = c->argv[0];
+      if (c->argv[0] != NULL) {
+        listen_addr = c->argv[0];
+      }
     }
   }
  
@@ -3923,7 +3943,7 @@ MODRET core_eprt(cmd_rec *cmd) {
       *root_revoke == 1 &&
       session.c->local_port < 1024) {
     pr_log_debug(DEBUG0, "RootRevoke in effect, unable to bind to local "
-      "port %d for active transfer", session.c->local_port);
+      "port %d for active transfer", session.c->local_port-1);
     pr_response_add_err(R_500, _("Unable to service EPRT commands"));
 
     pr_cmd_set_errno(cmd, EPERM);
@@ -4089,14 +4109,18 @@ MODRET core_eprt(cmd_rec *cmd) {
       c = find_config(main_server->conf, CONF_PARAM, "MasqueradeAddress",
         FALSE);
       if (c != NULL) {
-        listen_addr = c->argv[0];
+        if (c->argv[0] != NULL) {
+          listen_addr = c->argv[0];
+        }
       }
     }
 
   } else {
     c = find_config(main_server->conf, CONF_PARAM, "MasqueradeAddress", FALSE);
     if (c != NULL) {
-      listen_addr = c->argv[0];
+      if (c->argv[0] != NULL) {
+        listen_addr = c->argv[0];
+      }
     }
   }
 
@@ -4626,7 +4650,8 @@ MODRET core_host(cmd_rec *cmd) {
     return PR_ERROR(cmd);
   }
 
-  named_server = pr_namebind_get_server(host, main_server->addr);
+  named_server = pr_namebind_get_server(host, main_server->addr,
+    session.c->local_port);
   if (named_server == NULL) {
     pr_log_debug(DEBUG0, "Unknown host '%s' requested on %s#%d, "
       "refusing HOST command", host, local_ipstr, main_server->ServerPort);
@@ -4691,7 +4716,6 @@ MODRET core_host(cmd_rec *cmd) {
    *
    * Modules implementing post_host handlers:
    *   mod_core
-   *   mod_tls
    *
    * Modules implementing 'sess-reinit' event handlers:
    *   mod_auth
@@ -4706,38 +4730,43 @@ MODRET core_host(cmd_rec *cmd) {
    *   mod_exec
    *   mod_facts
    *   mod_ident
+   *   mod_ldap
    *   mod_log
    *   mod_log_forensic
    *   mod_memcache
    *   mod_qos
+   *   mod_quotatab
+   *   mod_radius
+   *   mod_rewrite
    *   mod_site_misc
+   *   mod_sql
+   *   mod_sql_passwd
+   *   mod_tls
+   *   mod_wrap
+   *   mod_wrap2
    *   mod_xfer
    *
-   * Modules that MIGHT need post_host handlers:
+   * Modules that MIGHT need a session-reinit listener:
    *   mod_ratio
    *   mod_snmp
    *
-   * Modules that NEED a post_host handler:
-   *   mod_ldap
-   *   mod_quotatab et al
-   *   mod_radius
-   *   mod_rewrite
-   *   mod_shaper
-   *   mod_sql et al
-   *   mod_sql_passwd
-   *   mod_wrap
-   *   mod_wrap2 et al
-   *
-   * Modules that do NOT need a post_host handler:
+   * Modules that DO NOT NEED a session-reinit listener:
+   *   mod_auth_pam
    *   mod_ctrls_admin
    *   mod_dynmasq
-   *   mod_ifversion
    *   mod_ifsession
+   *   mod_ifversion
    *   mod_load
    *   mod_readme
    *   mod_sftp (HOST command is FTP only)
    *   mod_sftp_pam
    *   mod_sftp_sql
+   *   mod_shaper
+   *   mod_sql_mysql
+   *   mod_sql_postgres
+   *   mod_sql_odbc
+   *   mod_sql_sqlite
+   *   mod_tls_fscache
    *   mod_tls_memcache
    *   mod_tls_shmcache
    *   mod_unique_id
@@ -4764,7 +4793,7 @@ MODRET core_post_host(cmd_rec *cmd) {
     config_rec *c;
 
     /* Remove the TimeoutIdle timer. */
-    (void) pr_timer_remove(PR_TIMER_IDLE, NULL);
+    (void) pr_timer_remove(PR_TIMER_IDLE, ANY_MODULE);
 
     /* Restore the original TimeoutLinger value. */
     pr_data_set_linger(PR_TUNABLE_TIMEOUTLINGER);
@@ -4827,6 +4856,11 @@ MODRET core_post_host(cmd_rec *cmd) {
   return PR_DECLINED(cmd);
 }
 
+MODRET core_clnt(cmd_rec *cmd) {
+  pr_response_add(R_200, _("OK"));
+  return PR_HANDLED(cmd);
+}
+
 MODRET core_syst(cmd_rec *cmd) {
   pr_response_add(R_215, "UNIX Type: L8");
   return PR_HANDLED(cmd);
@@ -4866,16 +4900,32 @@ int core_chmod(cmd_rec *cmd, char *dir, mode_t mode) {
   return pr_fsio_chmod(dir,mode);
 }
 
-MODRET _chdir(cmd_rec *cmd, char *ndir) {
-  char *dir, *odir, *cdir;
+MODRET core_chdir(cmd_rec *cmd, char *ndir) {
+  char *dir, *orig_dir, *cdir;
+  int xerrno = 0;
   config_rec *c = NULL, *cdpath;
-  unsigned char show_symlinks = TRUE, *tmp = NULL;
+  unsigned char show_symlinks = TRUE, *ptr = NULL;
+  struct stat st;
 
-  odir = ndir;
+  orig_dir = ndir;
 
-  tmp = get_param_ptr(TOPLEVEL_CONF, "ShowSymlinks", FALSE);
-  if (tmp != NULL) {
-    show_symlinks = *tmp;
+  if (pr_fsio_lstat(ndir, &st) == 0) {
+    if (S_ISLNK(st.st_mode)) {
+      char buf[PR_TUNABLE_PATH_MAX];
+      int len;
+
+      len = dir_readlink(cmd->tmp_pool, ndir, buf, sizeof(buf)-1,
+        PR_DIR_READLINK_FL_HANDLE_REL_PATH);
+      if (len > 0) {
+        buf[len] = '\0';
+        ndir = pstrdup(cmd->tmp_pool, buf);
+      }
+    }
+  }
+
+  ptr = get_param_ptr(TOPLEVEL_CONF, "ShowSymlinks", FALSE);
+  if (ptr != NULL) {
+    show_symlinks = *ptr;
   }
 
   if (show_symlinks) {
@@ -4896,15 +4946,16 @@ MODRET _chdir(cmd_rec *cmd, char *ndir) {
       }
     }
 
-    if (!use_cdpath &&
+    if (use_cdpath == FALSE &&
         pr_fsio_chdir(dir, 0) < 0) {
+      xerrno = errno;
       use_cdpath = TRUE;
     }
 
     if (use_cdpath) {
       for (cdpath = find_config(main_server->conf, CONF_PARAM, "CDPath", TRUE);
-          cdpath != NULL; cdpath =
-            find_config_next(cdpath,cdpath->next,CONF_PARAM,"CDPath",TRUE)) {
+          cdpath != NULL;
+          cdpath = find_config_next(cdpath, cdpath->next, CONF_PARAM, "CDPath", TRUE)) {
         cdir = palloc(cmd->tmp_pool, strlen(cdpath->argv[0]) + strlen(ndir) + 2);
         snprintf(cdir, strlen(cdpath->argv[0]) + strlen(ndir) + 2,
                  "%s%s%s", (char *) cdpath->argv[0],
@@ -4919,10 +4970,12 @@ MODRET _chdir(cmd_rec *cmd, char *ndir) {
         }
       }
 
-      if (!cdpath) {
-        int xerrno = errno;
+      if (cdpath == FALSE) {
+        if (xerrno == 0) {
+          xerrno = errno;
+        }
 
-        pr_response_add_err(R_550, "%s: %s", odir, strerror(xerrno));
+        pr_response_add_err(R_550, "%s: %s", orig_dir, strerror(xerrno));
 
         pr_cmd_set_errno(cmd, xerrno);
         errno = xerrno;
@@ -4956,9 +5009,9 @@ MODRET _chdir(cmd_rec *cmd, char *ndir) {
     }            
 
     if (use_cdpath) {
-      for (cdpath = find_config(main_server->conf,CONF_PARAM,"CDPath",TRUE);
-          cdpath != NULL; cdpath =
-            find_config_next(cdpath,cdpath->next,CONF_PARAM,"CDPath",TRUE)) {
+      for (cdpath = find_config(main_server->conf, CONF_PARAM, "CDPath", TRUE);
+          cdpath != NULL;
+          cdpath = find_config_next(cdpath, cdpath->next, CONF_PARAM, "CDPath", TRUE)) {
         cdir = palloc(cmd->tmp_pool, strlen(cdpath->argv[0]) + strlen(ndir) + 2);
         snprintf(cdir, strlen(cdpath->argv[0]) + strlen(ndir) + 2,
                  "%s%s%s", (char *) cdpath->argv[0],
@@ -4974,10 +5027,12 @@ MODRET _chdir(cmd_rec *cmd, char *ndir) {
         }
       }
 
-      if (!cdpath) {
-        int xerrno = errno;
+      if (cdpath == NULL) {
+        if (xerrno == 0) {
+          xerrno = errno;
+        }
 
-        pr_response_add_err(R_550, "%s: %s", odir, strerror(xerrno));
+        pr_response_add_err(R_550, "%s: %s", orig_dir, strerror(xerrno));
 
         pr_cmd_set_errno(cmd, xerrno);
         errno = xerrno;
@@ -4998,18 +5053,17 @@ MODRET _chdir(cmd_rec *cmd, char *ndir) {
       FALSE);
   }
 
-  if (!c &&
-      session.anon_config) {
+  if (c == NULL &&
+      session.anon_config != NULL) {
     c = find_config(session.anon_config->subset, CONF_PARAM, "DisplayChdir",
       FALSE);
   }
 
-  if (!c) {
+  if (c == NULL) {
     c = find_config(cmd->server->conf, CONF_PARAM, "DisplayChdir", FALSE);
   }
 
-  if (c) {
-    struct stat st;
+  if (c != NULL) {
     time_t prev = 0;
 
     char *display = c->argv[0];
@@ -5057,6 +5111,7 @@ MODRET _chdir(cmd_rec *cmd, char *ndir) {
 MODRET core_rmd(cmd_rec *cmd) {
   int res;
   char *decoded_path, *dir;
+  struct stat st;
 
   CHECK_CMD_MIN_ARGS(cmd, 2);
 
@@ -5101,10 +5156,30 @@ MODRET core_rmd(cmd_rec *cmd) {
       return PR_ERROR(cmd);
   }
 
-  /* If told to rmdir a symlink to a directory, don't; you can't rmdir a
-   * symlink, you delete it.
-   */
-  dir = dir_canonical_path(cmd->tmp_pool, dir);
+  if (pr_fsio_lstat(dir, &st) == 0) {
+    if (S_ISLNK(st.st_mode)) {
+      char buf[PR_TUNABLE_PATH_MAX];
+      int len;
+
+      memset(buf, '\0', sizeof(buf));
+      len = dir_readlink(cmd->tmp_pool, dir, buf, sizeof(buf)-1,
+        PR_DIR_READLINK_FL_HANDLE_REL_PATH);
+      if (len > 0) {
+        buf[len] = '\0';
+        dir = pstrdup(cmd->tmp_pool, buf);
+
+      } else {
+        dir = dir_canonical_path(cmd->tmp_pool, dir);
+      }
+
+    } else {
+      dir = dir_canonical_path(cmd->tmp_pool, dir);
+    }
+
+  } else {
+    dir = dir_canonical_path(cmd->tmp_pool, dir);
+  }
+
   if (dir == NULL) {
     int xerrno = EINVAL;
 
@@ -5266,16 +5341,15 @@ MODRET core_cwd(cmd_rec *cmd) {
     return PR_ERROR(cmd);
   }
 
-  return _chdir(cmd, decoded_path);
+  return core_chdir(cmd, decoded_path);
 }
 
 MODRET core_cdup(cmd_rec *cmd) {
   CHECK_CMD_ARGS(cmd, 1);
-  return _chdir(cmd, "..");
+  return core_chdir(cmd, "..");
 }
 
-/* Returns the modification time of a file, as per RFC3659.
- */
+/* Returns the modification time of a file, as per RFC3659. */
 MODRET core_mdtm(cmd_rec *cmd) {
   char *decoded_path, *path;
   struct stat st;
@@ -5297,7 +5371,28 @@ MODRET core_mdtm(cmd_rec *cmd) {
     return PR_ERROR(cmd);
   }
 
-  path = dir_realpath(cmd->tmp_pool, decoded_path);
+  path = decoded_path;
+
+  if (pr_fsio_lstat(path, &st) == 0) {
+    if (S_ISLNK(st.st_mode)) {
+      char buf[PR_TUNABLE_PATH_MAX];
+      int len;
+
+      memset(buf, '\0', sizeof(buf));
+      len = dir_readlink(cmd->tmp_pool, path, buf, sizeof(buf)-1,
+        PR_DIR_READLINK_FL_HANDLE_REL_PATH);
+      if (len > 0) {
+        buf[len] = '\0';
+        path = pstrdup(cmd->tmp_pool, buf);
+
+      } else {
+        path = dir_realpath(cmd->tmp_pool, decoded_path);
+      }
+
+    } else {
+      path = dir_realpath(cmd->tmp_pool, decoded_path);
+    }
+  }
 
   if (!path ||
       !dir_check(cmd->tmp_pool, cmd, cmd->group, path, NULL) ||
@@ -5325,7 +5420,7 @@ MODRET core_mdtm(cmd_rec *cmd) {
       memset(buf, '\0', sizeof(buf));
 
       tm = pr_gmtime(cmd->tmp_pool, &st.st_mtime);
-      if (tm) {
+      if (tm != NULL) {
         snprintf(buf, sizeof(buf), "%04d%02d%02d%02d%02d%02d",
           tm->tm_year+1900, tm->tm_mon+1, tm->tm_mday, tm->tm_hour,
           tm->tm_min, tm->tm_sec);
@@ -5371,6 +5466,21 @@ MODRET core_size(cmd_rec *cmd) {
     pr_cmd_set_errno(cmd, xerrno);
     errno = xerrno;
     return PR_ERROR(cmd);
+  }
+
+  if (pr_fsio_lstat(decoded_path, &st) == 0) {
+    if (S_ISLNK(st.st_mode)) {
+      char buf[PR_TUNABLE_PATH_MAX];
+      int len;
+
+      memset(buf, '\0', sizeof(buf));
+      len = dir_readlink(cmd->tmp_pool, decoded_path, buf, sizeof(buf)-1,
+        PR_DIR_READLINK_FL_HANDLE_REL_PATH);
+      if (len > 0) {
+        buf[len] = '\0';
+        decoded_path = pstrdup(cmd->tmp_pool, buf);
+      }
+    }
   }
 
   path = dir_realpath(cmd->tmp_pool, decoded_path);
@@ -5775,9 +5885,9 @@ MODRET core_rnfr(cmd_rec *cmd) {
   /* Allow renaming a symlink, even a dangling one. */
   path = dir_canonical_path(cmd->tmp_pool, path);
 
-  if (!path ||
+  if (path == NULL ||
       !dir_check(cmd->tmp_pool, cmd, cmd->group, path, NULL) ||
-      !exists(path)) {
+      !exists2(cmd->tmp_pool, path)) {
     int xerrno = errno;
 
     pr_response_add_err(R_550, "%s: %s", cmd->arg, strerror(xerrno));
@@ -5801,9 +5911,8 @@ MODRET core_rnfr(cmd_rec *cmd) {
   pr_table_add(session.notes, "mod_core.rnfr-path",
     pstrdup(session.xfer.p, session.xfer.path), 0);
 
-  pr_response_add(R_350, _("File or directory exists, ready for "
-    "destination name"));
-
+  pr_response_add(R_350,
+    _("File or directory exists, ready for destination name"));
   return PR_HANDLED(cmd);
 }
 
@@ -5812,8 +5921,15 @@ MODRET core_noop(cmd_rec *cmd) {
   return PR_HANDLED(cmd);
 }
 
+static int feat_cmp(const void *a, const void *b) {
+  return strcasecmp(*((const char **) a), *((const char **) b));
+}
+
 MODRET core_feat(cmd_rec *cmd) {
+  register unsigned int i;
   const char *feat = NULL;
+  array_header *feats = NULL;
+
   CHECK_CMD_ARGS(cmd, 1);
 
   if (!dir_check(cmd->tmp_pool, cmd, cmd->group, session.vwd, NULL)) {
@@ -5830,27 +5946,27 @@ MODRET core_feat(cmd_rec *cmd) {
   }
 
   feat = pr_feat_get();
-  if (feat) {
-    feat = pstrcat(cmd->tmp_pool, _("Features:"), "\r\n ", feat, NULL);
-    while (TRUE) {
-      const char *next;
-
-      pr_signals_handle();
-
-      next = pr_feat_get_next();
-      if (next == NULL) {
-        break;
-      }
-
-      feat = pstrcat(cmd->tmp_pool, feat, "\r\n ", next, NULL);
-    }
-
-    pr_response_add(R_211, "%s", feat);
-    pr_response_add(R_DUP, _("End"));
-
-  } else {
+  if (feat == NULL) {
     pr_response_add(R_211, _("No features supported"));
+    return PR_HANDLED(cmd);
   }
+
+  feats = make_array(cmd->tmp_pool, 0, sizeof(char **));
+
+  while (feat != NULL) {
+    pr_signals_handle();
+    *((char **) push_array(feats)) = pstrdup(cmd->tmp_pool, feat);
+    feat = pr_feat_get_next();
+  }
+
+  /* Sort the features, for a prettier output. */
+  qsort(feats->elts, feats->nelts, sizeof(char *), feat_cmp);
+
+  pr_response_add(R_211, "%s", _("Features:"));
+  for (i = 0; i < feats->nelts; i++) {
+    pr_response_add(R_DUP, "%s", ((const char **) feats->elts)[i]);
+  }
+  pr_response_add(R_DUP, _("End"));
 
   return PR_HANDLED(cmd);
 }
@@ -5915,6 +6031,18 @@ MODRET core_opts(cmd_rec *cmd) {
 MODRET core_post_pass(cmd_rec *cmd) {
   config_rec *c;
 
+  /* Default transfer mode is ASCII */
+  session.sf_flags |= SF_ASCII;
+  c = find_config(main_server->conf, CONF_PARAM, "DefaultTransferMode", FALSE);
+  if (c != NULL) {
+    char *default_transfer_mode;
+
+    default_transfer_mode = c->argv[0];
+    if (strcasecmp(default_transfer_mode, "binary") == 0) {
+      session.sf_flags &= (SF_ALL^SF_ASCII);
+    }
+  }
+
   c = find_config(TOPLEVEL_CONF, CONF_PARAM, "TimeoutIdle", FALSE);
   if (c != NULL) {
     int prev_timeout, timeout;
@@ -5931,7 +6059,7 @@ MODRET core_post_pass(cmd_rec *cmd) {
       pr_timer_remove(PR_TIMER_IDLE, &core_module);
 
       if (timeout > 0) {
-        pr_timer_add(timeout, PR_TIMER_IDLE, NULL, core_idle_timeout_cb,
+        pr_timer_add(timeout, PR_TIMER_IDLE, &core_module, core_idle_timeout_cb,
           "TimeoutIdle");
       }
     }
@@ -6188,6 +6316,7 @@ static int core_init(void) {
   pr_help_add(C_FEAT, _("(returns feature list)"), TRUE);
   pr_help_add(C_OPTS, _("<sp> command [<sp> options]"), TRUE);
   pr_help_add(C_HOST, _("<cp> hostname"), TRUE);
+  pr_help_add(C_CLNT, _("<cp> client-info"), TRUE);
   pr_help_add(C_AUTH, _("<sp> base64-data"), FALSE);
   pr_help_add(C_CCC, _("(clears protection level)"), FALSE);
   pr_help_add(C_CONF, _("<sp> base64-data"), FALSE);
@@ -6350,8 +6479,8 @@ static int core_sess_init(void) {
 
   timeout_idle = pr_data_get_timeout(PR_DATA_TIMEOUT_IDLE);
   if (timeout_idle) {
-    pr_timer_add(timeout_idle, PR_TIMER_IDLE, NULL, core_idle_timeout_cb,
-      "TimeoutIdle");
+    pr_timer_add(timeout_idle, PR_TIMER_IDLE, &core_module,
+      core_idle_timeout_cb, "TimeoutIdle");
   }
 
   /* Check for a server-specific TimeoutLinger */
@@ -6736,6 +6865,8 @@ static cmdtable core_cmdtab[] = {
   { POST_CMD, C_PASS, G_NONE, core_post_pass, FALSE, FALSE },
   { CMD, C_HOST, G_NONE,  core_host,	FALSE,	FALSE,	CL_AUTH },
   { POST_CMD, C_HOST, G_NONE, core_post_host, FALSE, FALSE },
+  { CMD, C_CLNT, G_NONE,  core_clnt,	FALSE,	FALSE,	CL_INFO },
+
   { 0, NULL }
 };
 

@@ -249,8 +249,9 @@ config_rec *pr_parser_config_ctxt_close(int *empty) {
 }
 
 config_rec *pr_parser_config_ctxt_get(void) {
-  if (parser_curr_config)
+  if (parser_curr_config) {
     return *parser_curr_config;
+  }
 
   errno = ENOENT;
   return NULL;
@@ -261,7 +262,7 @@ config_rec *pr_parser_config_ctxt_open(const char *name) {
   pool *c_pool = NULL, *parent_pool = NULL;
   xaset_t **set = NULL;
 
-  if (!name) {
+  if (name == NULL) {
     errno = EINVAL;
     return NULL;
   }
@@ -283,7 +284,7 @@ config_rec *pr_parser_config_ctxt_open(const char *name) {
    * prematurely, and helps to avoid memory leaks.
    */
   if (strncasecmp(name, "<Global>", 9) == 0) {
-    if (!global_config_pool) {
+    if (global_config_pool == NULL) {
       global_config_pool = make_sub_pool(permanent_pool);
       pr_pool_tag(global_config_pool, "<Global> Pool");
     }
@@ -310,8 +311,9 @@ config_rec *pr_parser_config_ctxt_open(const char *name) {
   c->name = pstrdup(c->pool, name);
 
   if (parent) {
-    if (parent->config_type == CONF_DYNDIR)
+    if (parent->config_type == CONF_DYNDIR) {
       c->flags |= CF_DYNAMIC;
+    }
   }
 
   add_config_ctxt(c);
@@ -330,6 +332,7 @@ int pr_parser_parse_file(pool *p, const char *path, config_rec *start,
   cmd_rec *cmd;
   pool *tmp_pool;
   char *report_path;
+  char buf[PR_TUNABLE_BUFFER_SIZE+1];
 
   if (path == NULL) {
     errno = EINVAL;
@@ -340,11 +343,13 @@ int pr_parser_parse_file(pool *p, const char *path, config_rec *start,
   pr_pool_tag(tmp_pool, "parser file pool");
 
   report_path = (char *) path;
-  if (session.chroot_path)
+  if (session.chroot_path) {
     report_path = pdircat(tmp_pool, session.chroot_path, path, NULL);
+  }
 
-  if (!(flags & PR_PARSER_FL_DYNAMIC_CONFIG))
+  if (!(flags & PR_PARSER_FL_DYNAMIC_CONFIG)) {
     pr_trace_msg(trace_channel, 3, "parsing '%s' configuration", report_path);
+  }
 
   fh = pr_fsio_open(path, O_RDONLY);
   if (fh == NULL) {
@@ -397,8 +402,14 @@ int pr_parser_parse_file(pool *p, const char *path, config_rec *start,
     add_config_ctxt(start);
   }
 
-  while ((cmd = pr_parser_parse_line(tmp_pool)) != NULL) {
+  memset(buf, '\0', sizeof(buf));
+  while (pr_parser_read_line(buf, sizeof(buf)-1) != NULL) {
     pr_signals_handle();
+
+    cmd = pr_parser_parse_line(tmp_pool, buf, 0);
+    if (cmd == NULL) {
+      continue;
+    }
 
     if (cmd->argc) {
       conftable *conftab;
@@ -424,11 +435,11 @@ int pr_parser_parse_file(pool *p, const char *path, config_rec *start,
         mr = pr_module_call(conftab->m, conftab->handler, cmd);
         if (mr != NULL) {
           if (MODRET_ISERROR(mr)) {
-
             if (!(flags & PR_PARSER_FL_DYNAMIC_CONFIG)) {
               pr_log_pri(PR_LOG_WARNING, "fatal: %s on line %u of '%s'",
                 MODRET_ERRMSG(mr), cs->cs_lineno, report_path);
-              exit(1);
+              errno = EPERM;
+              return -1;
 
             } else {
               pr_log_pri(PR_LOG_WARNING, "warning: %s on line %u of '%s'",
@@ -485,7 +496,8 @@ int pr_parser_parse_file(pool *p, const char *path, config_rec *start,
               "'%s' (contains non-ASCII characters)", name);
           }
 
-          exit(1);
+          errno = EPERM;
+          return -1;
         }
 
         pr_log_pri(PR_LOG_WARNING, "warning: unknown configuration directive "
@@ -498,6 +510,7 @@ int pr_parser_parse_file(pool *p, const char *path, config_rec *start,
     }
 
     destroy_pool(cmd->pool);
+    memset(buf, '\0', sizeof(buf));
   }
 
   /* Pop this configuration stream from the stack. */
@@ -509,107 +522,113 @@ int pr_parser_parse_file(pool *p, const char *path, config_rec *start,
   return 0;
 }
 
-cmd_rec *pr_parser_parse_line(pool *p) {
+cmd_rec *pr_parser_parse_line(pool *p, const char *text, size_t text_len) {
   register unsigned int i;
-  char buf[PR_TUNABLE_BUFFER_SIZE+1], *arg = "", *word = NULL;
+  char *arg = "", *ptr, *word = NULL;
   cmd_rec *cmd = NULL;
   pool *sub_pool = NULL;
   array_header *arr = NULL;
 
-  if (p == NULL) {
+  if (p == NULL ||
+      text == NULL) {
     errno = EINVAL;
     return NULL;
   }
 
-  memset(buf, '\0', sizeof(buf));
-  
-  while (pr_parser_read_line(buf, sizeof(buf)-1) != NULL) {
-    char *bufp = buf;
-
-    pr_signals_handle();
-
-    /* Build a new pool for the command structure and array */
-    sub_pool = make_sub_pool(p);
-    pr_pool_tag(sub_pool, "parser cmd subpool");
-
-    cmd = pcalloc(sub_pool, sizeof(cmd_rec));
-    cmd->pool = sub_pool;
-    cmd->stash_index = -1;
-    cmd->stash_hash = 0;
-
-    /* Add each word to the array */
-    arr = make_array(cmd->pool, 4, sizeof(char **));
-    while ((word = pr_str_get_word(&bufp, 0)) != NULL) {
-      char *tmp;
-
-      tmp = get_config_word(cmd->pool, word);
-
-      *((char **) push_array(arr)) = tmp;
-      cmd->argc++;
-    }
-
-    /* Terminate the array with a NULL. */
-    *((char **) push_array(arr)) = NULL;
-
-    /* The array header's job is done, we can forget about it and
-     * it will get purged when the command's pool is destroyed.
-     */
-
-    cmd->argv = (void **) arr->elts;
-
-    /* Perform a fixup on configuration directives so that:
-     *
-     *   -argv[0]--  -argv[1]-- ----argv[2]-----
-     *   <Option     /etc/adir  /etc/anotherdir>
-     *
-     *  becomes:
-     *
-     *   -argv[0]--  -argv[1]-  ----argv[2]----
-     *   <Option>    /etc/adir  /etc/anotherdir
-     */
-
-    if (cmd->argc &&
-        *((char *) cmd->argv[0]) == '<') {
-      char *cp;
-
-      cp = cmd->argv[cmd->argc-1];
-      if (*(cp + strlen(cp)-1) == '>' &&
-          cmd->argc > 1) {
-
-        if (strncmp(cp, ">", 2) == 0) {
-          cmd->argv[cmd->argc-1] = NULL;
-          cmd->argc--;
-
-        } else {
-          *(cp + strlen(cp)-1) = '\0';
-        }
-
-        cp = cmd->argv[0];
-        if (*(cp + strlen(cp)-1) != '>') {
-          cmd->argv[0] = pstrcat(cmd->pool, cp, ">", NULL);
-        }
-      }
-    }
-
-    if (cmd->argc < 2) {
-      arg = pstrdup(cmd->pool, arg);
-    }
-
-    for (i = 1; i < cmd->argc; i++) {
-      arg = pstrcat(cmd->pool, arg, *arg ? " " : "", cmd->argv[i], NULL);
-    }
-
-    cmd->arg = arg;
-    return cmd;
+  if (text_len == 0) {
+    text_len = strlen(text);
   }
 
-  return NULL;
+  if (text_len == 0) {
+    errno = ENOENT;
+    return NULL;
+  }
+
+  ptr = (char *) text;
+
+  /* Build a new pool for the command structure and array */
+  sub_pool = make_sub_pool(p);
+  pr_pool_tag(sub_pool, "parser cmd subpool");
+
+  cmd = pcalloc(sub_pool, sizeof(cmd_rec));
+  cmd->pool = sub_pool;
+  cmd->stash_index = -1;
+  cmd->stash_hash = 0;
+
+  /* Add each word to the array */
+  arr = make_array(cmd->pool, 4, sizeof(char **));
+  while ((word = pr_str_get_word(&ptr, 0)) != NULL) {
+    char *ptr2;
+
+    pr_signals_handle();
+    ptr2 = get_config_word(cmd->pool, word);
+    *((char **) push_array(arr)) = ptr2;
+    cmd->argc++;
+  }
+
+  /* Terminate the array with a NULL. */
+  *((char **) push_array(arr)) = NULL;
+
+  /* The array header's job is done, we can forget about it and
+   * it will get purged when the command's pool is destroyed.
+   */
+
+  cmd->argv = (void **) arr->elts;
+
+  /* Perform a fixup on configuration directives so that:
+   *
+   *   -argv[0]--  -argv[1]-- ----argv[2]-----
+   *   <Option     /etc/adir  /etc/anotherdir>
+   *
+   *  becomes:
+   *
+   *   -argv[0]--  -argv[1]-  ----argv[2]----
+   *   <Option>    /etc/adir  /etc/anotherdir
+   */
+
+  if (cmd->argc &&
+      *((char *) cmd->argv[0]) == '<') {
+    char *cp;
+    size_t cp_len;
+
+    cp = cmd->argv[cmd->argc-1];
+    cp_len = strlen(cp);
+
+    if (*(cp + cp_len-1) == '>' &&
+        cmd->argc > 1) {
+
+      if (strncmp(cp, ">", 2) == 0) {
+        cmd->argv[cmd->argc-1] = NULL;
+        cmd->argc--;
+
+      } else {
+        *(cp + cp_len-1) = '\0';
+      }
+
+      cp = cmd->argv[0];
+      cp_len = strlen(cp);
+      if (*(cp + cp_len-1) != '>') {
+        cmd->argv[0] = pstrcat(cmd->pool, cp, ">", NULL);
+      }
+    }
+  }
+
+  if (cmd->argc < 2) {
+    arg = pstrdup(cmd->pool, arg);
+  }
+
+  for (i = 1; i < cmd->argc; i++) {
+    arg = pstrcat(cmd->pool, arg, *arg ? " " : "", cmd->argv[i], NULL);
+  }
+
+  cmd->arg = arg;
+  return cmd;
 }
 
 int pr_parser_prepare(pool *p, xaset_t **parsed_servers) {
 
-  if (!p) {
-    if (!parser_pool) {
+  if (p == NULL) {
+    if (parser_pool == NULL) {
       parser_pool = make_sub_pool(permanent_pool);
       pr_pool_tag(parser_pool, "Parser Pool");
     }
@@ -648,12 +667,13 @@ char *pr_parser_read_line(char *buf, size_t bufsz) {
   /* Always use the config stream at the top of the stack. */
   cs = parser_sources;
 
-  if (!buf) {
+  if (buf == NULL ||
+      cs == NULL) {
     errno = EINVAL;
     return NULL;
   }
 
-  if (!cs->cs_fh) {
+  if (cs->cs_fh == NULL) {
     errno = EPERM;
     return NULL;
   }
@@ -733,8 +753,9 @@ server_rec *pr_parser_server_ctxt_close(void) {
 }
 
 server_rec *pr_parser_server_ctxt_get(void) {
-  if (parser_curr_server)
+  if (parser_curr_server) {
     return *parser_curr_server;
+  }
 
   errno = ENOENT;
   return NULL;

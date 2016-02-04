@@ -1,6 +1,6 @@
 /*
  * ProFTPD - FTP server daemon
- * Copyright (c) 2001-2015 The ProFTPD Project team
+ * Copyright (c) 2001-2016 The ProFTPD Project team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -192,11 +192,13 @@ static int core_netio_poll_cb(pr_netio_stream_t *nstrm) {
   while (res < 0) {
     int xerrno = errno;
 
-    /* Watch for EAGAIN, and handle it by delaying temporarily. */
-    if (xerrno == EAGAIN) {
-      errno = EINTR;
-      pr_signals_handle();
-      continue;
+    if (!(nstrm->strm_flags & PR_NETIO_SESS_INTR)) {
+      /* Watch for EAGAIN, and handle it by delaying temporarily. */
+      if (xerrno == EAGAIN) {
+        errno = EINTR;
+        pr_signals_handle();
+        continue;
+      }
     }
 
     errno = nstrm->strm_errno = xerrno;
@@ -242,11 +244,11 @@ static const char *netio_stream_mode(int strm_mode) {
 
   switch (strm_mode) {
     case PR_NETIO_IO_RD:
-      modestr = "read";
+      modestr = "reading";
       break;
 
     case PR_NETIO_IO_WR:
-      modestr = "write";
+      modestr = "writing";
       break;
 
     default:
@@ -364,7 +366,7 @@ int pr_netio_close(pr_netio_stream_t *nstrm) {
     case PR_NETIO_STRM_OTHR:
       if (othr_netio != NULL) {
         pr_trace_msg(trace_channel, 19, "using %s close() for other %s stream",
-          data_netio->owner_name, nstrm_mode);
+          othr_netio->owner_name, nstrm_mode);
         res = (othr_netio->close)(nstrm);
 
       } else {
@@ -388,6 +390,17 @@ static int netio_lingering_close(pr_netio_stream_t *nstrm, long linger,
   if (nstrm == NULL) {
     errno = EINVAL;
     return -1;
+  }
+
+  switch (nstrm->strm_type) {
+    case PR_NETIO_STRM_CTRL:
+    case PR_NETIO_STRM_DATA:
+    case PR_NETIO_STRM_OTHR:
+      break;
+
+    default:
+      errno = EPERM;
+      return -1;
   }
 
   if (nstrm->strm_fd < 0) {
@@ -514,6 +527,17 @@ int pr_netio_lingering_abort(pr_netio_stream_t *nstrm, long linger) {
     return -1;
   }
 
+  switch (nstrm->strm_type) {
+    case PR_NETIO_STRM_CTRL:
+    case PR_NETIO_STRM_DATA:
+    case PR_NETIO_STRM_OTHR:
+      break;
+
+    default:
+      errno = EPERM;
+      return -1;
+  }
+
   /* Send an appropriate response code down the stream asychronously. */
   pr_response_send_async(R_426, _("Transfer aborted. Data connection closed."));
 
@@ -553,6 +577,8 @@ int pr_netio_lingering_abort(pr_netio_stream_t *nstrm, long linger) {
     }
   }
 
+  nstrm->strm_flags |= PR_NETIO_SESS_ABORT;
+
   /* Now continue with a normal lingering close. */
   return netio_lingering_close(nstrm, linger,
     NETIO_LINGERING_CLOSE_FL_NO_SHUTDOWN);  
@@ -582,15 +608,23 @@ pr_netio_stream_t *pr_netio_open(pool *parent_pool, int strm_type, int fd,
       nstrm->strm_mode = mode;
 
       if (ctrl_netio != NULL) {
-        pr_table_add(nstrm->notes, pstrdup(nstrm->strm_pool, "core.netio"),
-          ctrl_netio, sizeof(pr_netio_t *));
+        if (pr_table_add(nstrm->notes, pstrdup(nstrm->strm_pool, "core.netio"),
+            ctrl_netio, sizeof(pr_netio_t *)) < 0) {
+          pr_trace_msg(trace_channel, 9,
+            "error stashing 'core.netio' note for ctrl stream: %s",
+            strerror(errno));
+        }
         pr_trace_msg(trace_channel, 19, "using %s open() for control %s stream",
           ctrl_netio->owner_name, nstrm_mode);
         return (ctrl_netio->open)(nstrm, fd, mode);
 
       } else {
-        pr_table_add(nstrm->notes, pstrdup(nstrm->strm_pool, "core.netio"),
-          default_ctrl_netio, sizeof(pr_netio_t *));
+        if (pr_table_add(nstrm->notes, pstrdup(nstrm->strm_pool, "core.netio"),
+            default_ctrl_netio, sizeof(pr_netio_t *)) < 0) {
+          pr_trace_msg(trace_channel, 9,
+            "error stashing 'core.netio' note for ctrl stream: %s",
+            strerror(errno));
+        }
         pr_trace_msg(trace_channel, 19, "using %s open() for control %s stream",
           default_ctrl_netio->owner_name, nstrm_mode);
         return (default_ctrl_netio->open)(nstrm, fd, mode);
@@ -601,15 +635,23 @@ pr_netio_stream_t *pr_netio_open(pool *parent_pool, int strm_type, int fd,
       nstrm->strm_mode = mode;
 
       if (data_netio != NULL) {
-        pr_table_add(nstrm->notes, pstrdup(nstrm->strm_pool, "core.netio"),
-          data_netio, sizeof(pr_netio_t *));
+        if (pr_table_add(nstrm->notes, pstrdup(nstrm->strm_pool, "core.netio"),
+            data_netio, sizeof(pr_netio_t *)) < 0) {
+          pr_trace_msg(trace_channel, 9,
+            "error stashing 'core.netio' note for data stream: %s",
+            strerror(errno));
+        }
         pr_trace_msg(trace_channel, 19, "using %s open() for data %s stream",
           data_netio->owner_name, nstrm_mode);
         return (data_netio->open)(nstrm, fd, mode);
 
       } else {
-        pr_table_add(nstrm->notes, pstrdup(nstrm->strm_pool, "core.netio"),
-          default_data_netio, sizeof(pr_netio_t *));
+        if (pr_table_add(nstrm->notes, pstrdup(nstrm->strm_pool, "core.netio"),
+            default_data_netio, sizeof(pr_netio_t *)) < 0) {
+          pr_trace_msg(trace_channel, 9,
+            "error stashing 'core.netio' note for data stream: %s",
+            strerror(errno));
+        }
         pr_trace_msg(trace_channel, 19, "using %s open() for data %s stream",
           default_data_netio->owner_name, nstrm_mode);
         return (default_data_netio->open)(nstrm, fd, mode);
@@ -620,15 +662,23 @@ pr_netio_stream_t *pr_netio_open(pool *parent_pool, int strm_type, int fd,
       nstrm->strm_mode = mode;
 
       if (othr_netio != NULL) {
-        pr_table_add(nstrm->notes, pstrdup(nstrm->strm_pool, "core.netio"),
-          othr_netio, sizeof(pr_netio_t *));
+        if (pr_table_add(nstrm->notes, pstrdup(nstrm->strm_pool, "core.netio"),
+            othr_netio, sizeof(pr_netio_t *)) < 0) {
+          pr_trace_msg(trace_channel, 9,
+            "error stashing 'core.netio' note for othr stream: %s",
+            strerror(errno));
+        }
         pr_trace_msg(trace_channel, 19, "using %s open() for other %s stream",
           othr_netio->owner_name, nstrm_mode);
         return (othr_netio->open)(nstrm, fd, mode);
 
       } else {
-        pr_table_add(nstrm->notes, pstrdup(nstrm->strm_pool, "core.netio"),
-          default_othr_netio, sizeof(pr_netio_t *));
+        if (pr_table_add(nstrm->notes, pstrdup(nstrm->strm_pool, "core.netio"),
+            default_othr_netio, sizeof(pr_netio_t *)) < 0) {
+          pr_trace_msg(trace_channel, 9,
+            "error stashing 'core.netio' note for othr stream: %s",
+            strerror(errno));
+        }
         pr_trace_msg(trace_channel, 19, "using %s open() for other %s stream",
           default_othr_netio->owner_name, nstrm_mode);
         return (default_othr_netio->open)(nstrm, fd, mode);
@@ -712,7 +762,6 @@ void pr_netio_reset_poll_interval(pr_netio_stream_t *nstrm) {
 
 void pr_netio_set_poll_interval(pr_netio_stream_t *nstrm, unsigned int secs) {
   if (nstrm == NULL) {
-    errno = EINVAL;
     return;
   }
 
@@ -794,65 +843,68 @@ int pr_netio_poll(pr_netio_stream_t *nstrm) {
         break;
     }
 
-    switch (res) {
-      case -1:
-        xerrno = errno;
-        if (xerrno == EINTR) {
-          if (nstrm->strm_flags & PR_NETIO_SESS_ABORT) {
-            nstrm->strm_flags &= ~PR_NETIO_SESS_ABORT;
-            return 1;
-          }
-
-	  /* Otherwise, restart the call */
-          pr_signals_handle();
-          continue;
-        }
-
-        /* Some other error occured */
-        nstrm->strm_errno = xerrno;
-
-        /* If this is the control stream, and the error indicates a
-         * broken pipe (i.e. the client went away), AND there is a data
-         * transfer is progress, abort the transfer.
-         */
-        if (xerrno == EPIPE &&
-            nstrm->strm_type == PR_NETIO_STRM_CTRL &&
-            (session.sf_flags & SF_XFER)) {
-          pr_trace_msg(trace_channel, 5,
-            "received EPIPE on control connection, setting 'aborted' "
-            "session flag");
-          session.sf_flags |= SF_ABORT;
-        }
-
-        errno = nstrm->strm_errno;
-        return -1;
-
-      case 0:
-        /* In case the kernel doesn't support interrupted syscalls. */
+    if (res == -1) {
+      xerrno = errno;
+      if (xerrno == EINTR) {
         if (nstrm->strm_flags & PR_NETIO_SESS_ABORT) {
           nstrm->strm_flags &= ~PR_NETIO_SESS_ABORT;
           return 1;
         }
 
-        /* If the stream has been marked as "interruptible", AND the
-         * poll interval is zero seconds (meaning a true poll, not blocking),
-         * then return here.
-         */
-        if ((nstrm->strm_flags & PR_NETIO_SESS_INTR) &&
-            nstrm->strm_interval == 0) {
-          errno = EOF;
+        if (nstrm->strm_flags & PR_NETIO_SESS_INTR) {
+          errno = nstrm->strm_errno = xerrno;
           return -1;
         }
 
+        /* Otherwise, restart the call */
+        pr_signals_handle();
         continue;
+      }
 
-      default:
-        return 0;
+      /* Some other error occured */
+      nstrm->strm_errno = xerrno;
+
+      /* If this is the control stream, and the error indicates a
+       * broken pipe (i.e. the client went away), AND there is a data
+       * transfer is progress, abort the transfer.
+       */
+      if (xerrno == EPIPE &&
+          nstrm->strm_type == PR_NETIO_STRM_CTRL &&
+          (session.sf_flags & SF_XFER)) {
+        pr_trace_msg(trace_channel, 5,
+          "received EPIPE on control connection, setting 'aborted' "
+          "session flag");
+        session.sf_flags |= SF_ABORT;
+      }
+
+      errno = nstrm->strm_errno;
+      return -1;
     }
+
+    if (res == 0) {
+      /* In case the kernel doesn't support interrupted syscalls. */
+      if (nstrm->strm_flags & PR_NETIO_SESS_ABORT) {
+        nstrm->strm_flags &= ~PR_NETIO_SESS_ABORT;
+        return 1;
+      }
+
+      /* If the stream has been marked as "interruptible", AND the
+       * poll interval is zero seconds (meaning a true poll, not blocking),
+       * then return here.
+       */
+      if ((nstrm->strm_flags & PR_NETIO_SESS_INTR) &&
+          nstrm->strm_interval == 0) {
+        errno = EOF;
+        return -1;
+      }
+
+      continue;
+    }
+
+    break;
   }
 
-  /* This will never be reached. */
-  return -1;
+  return 0;
 }
 
 int pr_netio_postopen(pr_netio_stream_t *nstrm) {
@@ -963,10 +1015,12 @@ int pr_netio_write(pr_netio_stream_t *nstrm, char *buf, size_t buflen) {
   int bwritten = 0, total = 0;
   const char *nstrm_mode;
   pr_buffer_t *pbuf;
-  pool *sub_pool;
+  pool *tmp_pool;
 
   /* Sanity check */
-  if (!nstrm) {
+  if (nstrm == NULL ||
+      buf == NULL ||
+      buflen == 0) {
     errno = EINVAL;
     return -1;
   }
@@ -989,8 +1043,8 @@ int pr_netio_write(pr_netio_stream_t *nstrm, char *buf, size_t buflen) {
    * pr_buffer_t out of that.  Then simply destroy the subpool when done.
    */
 
-  sub_pool = pr_pool_create_sz(nstrm->strm_pool, 64);
-  pbuf = pcalloc(sub_pool, sizeof(pr_buffer_t));
+  tmp_pool = make_sub_pool(nstrm->strm_pool);
+  pbuf = pcalloc(tmp_pool, sizeof(pr_buffer_t));
   pbuf->buf = buf;
   pbuf->buflen = buflen;
   pbuf->current = pbuf->buf;
@@ -1013,7 +1067,7 @@ int pr_netio_write(pr_netio_stream_t *nstrm, char *buf, size_t buflen) {
   /* The event listeners may have changed the data to write out. */
   buf = pbuf->buf;
   buflen = pbuf->buflen - pbuf->remaining;
-  destroy_pool(sub_pool);
+  destroy_pool(tmp_pool);
 
   while (buflen) {
 
@@ -1053,7 +1107,7 @@ int pr_netio_write(pr_netio_stream_t *nstrm, char *buf, size_t buflen) {
 
               if (data_netio != NULL) {
                 pr_trace_msg(trace_channel, 19,
-                  "using %s write() for data %s stream", ctrl_netio->owner_name,
+                  "using %s write() for data %s stream", data_netio->owner_name,
                   nstrm_mode);
                 bwritten = (data_netio->write)(nstrm, buf, buflen);
 
@@ -1103,6 +1157,7 @@ int pr_netio_write_async(pr_netio_stream_t *nstrm, char *buf, size_t buflen) {
   int bwritten = 0, flags = 0, total = 0;
   const char *nstrm_mode;
   pr_buffer_t *pbuf;
+  pool *tmp_pool;
 
   /* Sanity check */
   if (nstrm == NULL) {
@@ -1131,7 +1186,8 @@ int pr_netio_write_async(pr_netio_stream_t *nstrm, char *buf, size_t buflen) {
    * for any listeners which may want to examine this data.
    */
 
-  pbuf = pcalloc(nstrm->strm_pool, sizeof(pr_buffer_t));
+  tmp_pool = make_sub_pool(nstrm->strm_pool);
+  pbuf = pcalloc(tmp_pool, sizeof(pr_buffer_t));
   pbuf->buf = buf;
   pbuf->buflen = buflen;
   pbuf->current = pbuf->buf;
@@ -1154,6 +1210,7 @@ int pr_netio_write_async(pr_netio_stream_t *nstrm, char *buf, size_t buflen) {
   /* The event listeners may have changed the data to write out. */
   buf = pbuf->buf;
   buflen = pbuf->buflen - pbuf->remaining;
+  destroy_pool(tmp_pool);
 
   while (buflen) {
     do {
@@ -1241,9 +1298,13 @@ int pr_netio_read(pr_netio_stream_t *nstrm, char *buf, size_t buflen,
     int bufmin) {
   int bread = 0, total = 0;
   const char *nstrm_mode;
+  pr_buffer_t *pbuf;
+  pool *tmp_pool;
 
   /* Sanity check. */
-  if (nstrm == NULL) {
+  if (nstrm == NULL ||
+      buf == NULL ||
+      buflen == 0) {
     errno = EINVAL;
     return -1;
   }
@@ -1372,6 +1433,43 @@ int pr_netio_read(pr_netio_stream_t *nstrm, char *buf, size_t buflen,
       break;
     }
 
+    /* Before we provide the data from the client, generate an event
+     * for any listeners which may want to examine this data.  To do this, we
+     * need to allocate a pr_buffer_t for sending the buffer data to the
+     * listeners.
+     *
+     * We could just use nstrm->strm_pool, but for a long-lived control
+     * connection, this would amount to a slow memory increase.  So instead,
+     * we create a subpool from the stream's pool, and allocate the
+     * pr_buffer_t out of that.  Then simply destroy the subpool when done.
+     */
+
+    tmp_pool = make_sub_pool(nstrm->strm_pool);
+    pbuf = pcalloc(tmp_pool, sizeof(pr_buffer_t));
+    pbuf->buf = buf;
+    pbuf->buflen = bread;
+    pbuf->current = pbuf->buf;
+    pbuf->remaining = 0;
+
+    switch (nstrm->strm_type) {
+      case PR_NETIO_STRM_CTRL:
+        pr_event_generate("core.ctrl-read", pbuf);
+        break;
+
+      case PR_NETIO_STRM_DATA:
+        pr_event_generate("core.data-read", pbuf);
+        break;
+
+      case PR_NETIO_STRM_OTHR:
+        pr_event_generate("core.othr-read", pbuf);
+        break;
+    }
+
+    /* The event listeners may have changed the data read in out. */
+    buf = pbuf->buf;
+    bread = pbuf->buflen - pbuf->remaining;
+    destroy_pool(tmp_pool);
+
     buf += bread;
     total += bread;
     bufmin -= bread;
@@ -1449,7 +1547,9 @@ char *pr_netio_gets(char *buf, size_t buflen, pr_netio_stream_t *nstrm) {
   int toread;
   pr_buffer_t *pbuf = NULL;
 
-  if (buflen == 0) {
+  if (nstrm == NULL ||
+      buf == NULL ||
+      buflen == 0) {
     errno = EINVAL;
     return NULL;
   }
@@ -1476,9 +1576,9 @@ char *pr_netio_gets(char *buf, size_t buflen, pr_netio_stream_t *nstrm) {
         if (bp != buf) {
           *bp = '\0';
           return buf;
+        }
 
-        } else
-          return NULL;
+        return NULL;
       }
 
       pbuf->remaining = pbuf->buflen - toread;
@@ -1888,7 +1988,12 @@ pr_netio_t *pr_alloc_netio2(pool *parent_pool, module *owner,
     }
 
   } else {
-    netio->owner_name = "default";
+    if (owner_name != NULL) {
+      netio->owner_name = owner_name;
+
+    } else {
+      netio->owner_name = "default";
+    }
   }
 
   /* Set the default NetIO handlers to the core handlers. */

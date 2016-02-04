@@ -37,6 +37,7 @@
 #endif
 
 int tests_stubs_set_main_server(server_rec *);
+int tests_stubs_set_next_cmd(cmd_rec *);
 
 Suite *tests_get_pool_suite(void);
 Suite *tests_get_array_suite(void);
@@ -72,6 +73,10 @@ Suite *tests_get_data_suite(void);
 Suite *tests_get_ascii_suite(void);
 Suite *tests_get_help_suite(void);
 Suite *tests_get_rlimit_suite(void);
+Suite *tests_get_encode_suite(void);
+Suite *tests_get_privs_suite(void);
+Suite *tests_get_display_suite(void);
+Suite *tests_get_misc_suite(void);
 
 /* Temporary hack/placement for this variable, until we get to testing
  * the Signals API.

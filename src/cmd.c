@@ -1,6 +1,6 @@
 /*
  * ProFTPD - FTP server daemon
- * Copyright (c) 2009-2015 The ProFTPD Project team
+ * Copyright (c) 2009-2016 The ProFTPD Project team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -106,6 +106,7 @@ static struct cmd_entry cmd_ids[] = {
   { C_MFF,	3 },	/* PR_CMD_MFF_ID (56) */
   { C_MFMT,	4 },	/* PR_CMD_MFMT_ID (57) */
   { C_HOST,	4 },	/* PR_CMD_HOST_ID (58) */
+  { C_CLNT,	4 },	/* PR_CMD_CLNT_ID (59) */
 
   { NULL,	0 }
 };
@@ -453,6 +454,14 @@ int pr_cmd_is_http(cmd_rec *cmd) {
     return -1;
   }
 
+  if (cmd->cmd_id == 0) {
+    cmd->cmd_id = pr_cmd_get_id(cmd_name);
+  }
+
+  if (cmd->cmd_id >= 0) {
+    return FALSE;
+  }
+
   cmd_namelen = strlen(cmd_name);
   return is_known_cmd(http_ids, cmd_name, cmd_namelen);
 }
@@ -472,6 +481,44 @@ int pr_cmd_is_smtp(cmd_rec *cmd) {
     return -1;
   }
 
+  if (cmd->cmd_id == 0) {
+    cmd->cmd_id = pr_cmd_get_id(cmd_name);
+  }
+
+  if (cmd->cmd_id >= 0) {
+    return FALSE;
+  }
+
   cmd_namelen = strlen(cmd_name);
   return is_known_cmd(smtp_ids, cmd_name, cmd_namelen);
+}
+
+int pr_cmd_is_ssh2(cmd_rec *cmd) {
+  const char *cmd_name;
+
+  if (cmd == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  cmd_name = cmd->argv[0];
+  if (cmd_name == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if (cmd->cmd_id == 0) {
+    cmd->cmd_id = pr_cmd_get_id(cmd_name);
+  }
+
+  if (cmd->cmd_id >= 0) {
+    return FALSE;
+  }
+
+  if (strncmp(cmd_name, "SSH-2.0-", 8) == 0 ||
+      strncmp(cmd_name, "SSH-1.99-", 9) == 0) {
+    return TRUE;
+  }
+
+  return FALSE;
 }

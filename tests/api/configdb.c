@@ -1,6 +1,6 @@
 /*
  * ProFTPD - FTP server testsuite
- * Copyright (c) 2014 The ProFTPD Project team
+ * Copyright (c) 2014-2015 The ProFTPD Project team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -22,8 +22,7 @@
  * OpenSSL in the source distribution.
  */
 
-/* Configuration API tests
- */
+/* Configuration API tests */
 
 #include "tests.h"
 
@@ -35,49 +34,105 @@ static void set_up(void) {
   }
 
   init_config();
+  pr_parser_prepare(p, NULL);
+
+  if (getenv("TEST_VERBOSE") != NULL) {
+    pr_trace_set_levels("config", 1, 20);
+  }
 }
 
 static void tear_down(void) {
+  if (getenv("TEST_VERBOSE") != NULL) {
+    pr_trace_set_levels("config", 0, 0);
+  }
+
+  pr_parser_cleanup();
+
   if (p) {
     destroy_pool(p);
     p = permanent_pool = NULL;
   } 
 }
 
-START_TEST (add_remove_config_test) {
+START_TEST (config_init_config_test) {
+  mark_point();
+  init_config();
+
+  mark_point();
+  init_config();
+
+  mark_point();
+  init_config();
+}
+END_TEST
+
+START_TEST (config_add_config_test) {
   int res;
-  xaset_t *set = NULL;
   const char *name = NULL;
   config_rec *c = NULL;
+  server_rec *s = NULL;
 
-  res = remove_config(NULL, NULL, FALSE);
-  fail_unless(res == 0, "Failed to handle null arguments: %s", strerror(errno));
+  s = pr_parser_server_ctxt_open("127.0.0.1");
+  fail_unless(s != NULL, "Failed to open server context: %s", strerror(errno));
 
   name = "foo";
 
-  c = add_config_set(NULL, name);
-  fail_unless(c == NULL, "Failed to handle null set argument");
-  fail_unless(errno == EINVAL, "Failed to set errno to EINVAL, got %d (%s)",
-    errno, strerror(errno));
-
-  c = add_config_set(&set, name);
-  fail_unless(c != NULL, "Failed to add config '%s' to set: %s", name,
+  mark_point();
+  c = add_config(NULL, name);
+  fail_unless(c != NULL, "Failed to add config '%s': %s", name,
     strerror(errno));
   fail_unless(c->config_type == 0, "Expected config_type 0, got %d",
     c->config_type);
 
-  res = remove_config(set, name, FALSE);
-  fail_unless(res > 0, "Failed to remove config '%s': %s", name,
-    strerror(errno));
+  mark_point();
+  pr_config_dump(NULL, s->conf, NULL);
 
-  name = "bar";
-  res = remove_config(set, name, FALSE);
-  fail_unless(res == 0, "Removed config '%s' unexpectedly", name,
+  c = add_config_param_set(&(c->subset), "bar", 1, "baz");
+
+  mark_point();
+  pr_config_dump(NULL, s->conf, NULL);
+
+  mark_point();
+  res = remove_config(s->conf, name, FALSE);
+  fail_unless(res > 0, "Failed to remove config '%s': %s", name,
     strerror(errno));
 }
 END_TEST
 
-START_TEST (add_config_param_set_test) {
+START_TEST (config_add_config_param_test) {
+  int res;
+  const char *name = NULL;
+  config_rec *c = NULL;
+  server_rec *s = NULL;
+
+  s = pr_parser_server_ctxt_open("127.0.0.1");
+  fail_unless(s != NULL, "Failed to open server context: %s", strerror(errno));
+ 
+  c = add_config_param(NULL, 0, NULL);
+  fail_unless(c == NULL, "Failed to handle null arguments");
+  fail_unless(errno == EINVAL, "Expected EINVAL (%d), got %s (%d)", EINVAL,
+    strerror(errno), errno); 
+
+  name = "foo";
+
+  mark_point();
+  c = add_config_param(name, 1, "bar");
+  fail_unless(c != NULL, "Failed to add config '%s': %s", name,
+    strerror(errno));
+  fail_unless(c->config_type == CONF_PARAM, "Expected config_type %d, got %d",
+    CONF_PARAM, c->config_type);
+
+  mark_point();
+  pr_config_dump(NULL, s->conf, NULL);
+
+  mark_point();
+  res = remove_config(s->conf, name, FALSE);
+  fail_unless(res > 0, "Failed to remove config '%s': %s", name,
+    strerror(errno));
+}
+END_TEST
+
+START_TEST (config_add_config_param_set_test) {
   xaset_t *set = NULL;
   const char *name = NULL;
   config_rec *c = NULL;
@@ -110,7 +165,115 @@ START_TEST (add_config_param_set_test) {
 }
 END_TEST
 
-START_TEST (find_config_test) {
+START_TEST (config_add_config_param_str_test) {
+  int res;
+  const char *name = NULL;
+  config_rec *c = NULL, *c2;
+  server_rec *s = NULL;
+
+  s = pr_parser_server_ctxt_open("127.0.0.1");
+  fail_unless(s != NULL, "Failed to open server context: %s", strerror(errno));
+
+  name = "foo";
+
+  mark_point();
+  c = add_config_param_str(name, 1, "bar");
+  fail_unless(c != NULL, "Failed to add config '%s': %s", name,
+    strerror(errno));
+  fail_unless(c->config_type == CONF_PARAM, "Expected config_type %d, got %d",
+    CONF_PARAM, c->config_type);
+
+  c2 = add_config_param_str("foo2", 1, NULL);
+  fail_unless(c2 != NULL, "Failed to add config 'foo2': %s", strerror(errno));
+
+  mark_point();
+  pr_config_dump(NULL, s->conf, NULL);
+
+  mark_point();
+  res = remove_config(s->conf, name, FALSE);
+  fail_unless(res > 0, "Failed to remove config '%s': %s", name,
+    strerror(errno));
+}
+END_TEST
+
+START_TEST (config_add_server_config_param_str_test) {
+  const char *name;
+  config_rec *c;
+  server_rec *s;
+
+  mark_point();
+  c = pr_conf_add_server_config_param_str(NULL, NULL, 0);
+  fail_unless(c == NULL, "Failed to handle null arguments");
+  fail_unless(errno == EINVAL, "Expected EINVAL (%d), got %s (%d)", EINVAL,
+    strerror(errno));
+
+  mark_point();
+  s = pr_parser_server_ctxt_open("127.0.0.2");
+  fail_unless(s != NULL, "Failed to open server context: %s", strerror(errno));
+
+  mark_point();
+  name = "foo";
+
+  c = pr_conf_add_server_config_param_str(s, name, 1, "bar");
+  fail_unless(c != NULL, "Failed to add config '%s': %s", name,
+    strerror(errno));
+
+  (void) remove_config(s->conf, name, FALSE);
+}
+END_TEST
+
+START_TEST (config_add_config_set_test) {
+  int flags = PR_CONFIG_FL_INSERT_HEAD, res;
+  xaset_t *set = NULL;
+  const char *name = NULL;
+  config_rec *c = NULL;
+
+  res = remove_config(NULL, NULL, FALSE);
+  fail_unless(res == 0, "Failed to handle null arguments: %s", strerror(errno));
+
+  name = "foo";
+
+  c = add_config_set(NULL, name);
+  fail_unless(c == NULL, "Failed to handle null set argument");
+  fail_unless(errno == EINVAL, "Failed to set errno to EINVAL, got %d (%s)",
+    errno, strerror(errno));
+
+  c = add_config_set(&set, name);
+  fail_unless(c != NULL, "Failed to add config '%s' to set: %s", name,
+    strerror(errno));
+  fail_unless(c->config_type == 0, "Expected config_type 0, got %d",
+    c->config_type);
+
+  res = remove_config(set, name, FALSE);
+  fail_unless(res > 0, "Failed to remove config '%s': %s", name,
+    strerror(errno));
+
+  name = "bar";
+  res = remove_config(set, name, FALSE);
+  fail_unless(res == 0, "Removed config '%s' unexpectedly", name,
+    strerror(errno));
+
+  c = pr_config_add_set(&set, name, flags);
+  fail_unless(c != NULL, "Failed to add config '%s' to set: %s", name,
+    strerror(errno));
+
+  /* XXX Note that calling this with recurse=TRUE yields a test timeout,
+   * suggestive of an infinite loop that needs to be tracked down and
+   * fixed.
+   *
+   * I suspect it's in find_config_next2() bit of code near the comment:
+   *
+   *  Restart the search at the previous level if required
+   *
+   * Given the "shallowness" of this particular set.
+   */
+  res = remove_config(set, name, FALSE);
+  fail_unless(res > 0, "Failed to remove config '%s': %s", name,
+    strerror(errno));
+}
+END_TEST
+
+START_TEST (config_find_config_test) {
   int res;
   config_rec *c;
   xaset_t *set = NULL;
@@ -118,8 +281,13 @@ START_TEST (find_config_test) {
 
   c = find_config(NULL, -1, NULL, FALSE);
   fail_unless(c == NULL, "Failed to handle null arguments");
-  fail_unless(errno == EINVAL, "Failed to set errno to EINVAL, got %d (%s)",
-    errno, strerror(errno));
+  fail_unless(errno == EINVAL, "Expected EINVAL (%d), got %s (%d)", EINVAL,
+    strerror(errno), errno);
+
+  c = find_config_next(NULL, NULL, CONF_PARAM, NULL, FALSE);
+  fail_unless(c == NULL, "Failed to handle null arguments");
+  fail_unless(errno == EINVAL, "Expected EINVAL (%d), got %s (%d)", EINVAL,
+    strerror(errno), errno);
 
   mark_point();
 
@@ -137,6 +305,7 @@ START_TEST (find_config_test) {
   mark_point();
 
   /* We expect to find "foo", but a 'next' should be empty. */
+
   name = "foo";
   c = find_config(set, -1, name, FALSE);
   fail_unless(c != NULL, "Failed to find config '%s': %s", name,
@@ -180,10 +349,17 @@ START_TEST (find_config_test) {
   fail_unless(c == NULL, "Found config '%s' unexpectedly", name);
   fail_unless(errno == ENOENT, "Failed to set errno to ENOENT, got %d (%s)",
     errno, strerror(errno));
+
+  name = "other";
+  c = find_config(set, -1, name, TRUE);
+  fail_unless(c == NULL, "Found config '%s' unexpectedly (recurse = true)",
+    name);
+  fail_unless(errno == ENOENT, "Expected ENOENT (%d), got %s (%d)", ENOENT,
+    strerror(errno), errno);
 }
 END_TEST
 
-START_TEST (find_config2_test) {
+START_TEST (config_find_config2_test) {
   int res;
   config_rec *c;
   xaset_t *set = NULL;
@@ -257,7 +433,7 @@ START_TEST (find_config2_test) {
 }
 END_TEST
 
-START_TEST (get_param_ptr_test) {
+START_TEST (config_get_param_ptr_test) {
   void *res;
   int count;
   xaset_t *set = NULL;
@@ -321,6 +497,11 @@ START_TEST (get_param_ptr_test) {
   res = get_param_ptr_next(name, FALSE);
   fail_unless(res != NULL, "Expected to find another config");
 
+  res = get_param_ptr_next(name, FALSE);
+  fail_unless(res == NULL, "Found another config unexpectedly");
+  fail_unless(errno == ENOENT, "Expected ENOENT (%d), got %s (%d)", ENOENT,
+    strerror(errno), errno);
+
   mark_point();
 
   name = "foo";
@@ -363,6 +544,77 @@ START_TEST (config_set_get_id_test) {
 }
 END_TEST
 
+START_TEST (config_merge_down_test) {
+  xaset_t *set;
+  config_rec *c, *src, *dst;
+  const char *name;
+
+  mark_point();
+  pr_config_merge_down(NULL, FALSE);
+
+  mark_point();
+  set = xaset_create(p, NULL);
+  pr_config_merge_down(set, FALSE);
+
+  name = "foo";
+  c = add_config_param_set(&set, name, 0);
+
+  mark_point();
+  pr_config_merge_down(set, FALSE);
+
+  name = "bar";
+  c = add_config_param_set(&set, name, 1, "baz");
+  c->flags |= CF_MERGEDOWN;
+
+  mark_point();
+  pr_config_merge_down(set, FALSE);
+
+  name = "BAZ";
+  c = add_config_param_set(&set, name, 2, "quxx", "Quzz");
+  c->flags |= CF_MERGEDOWN_MULTI;
+
+  mark_point();
+  pr_config_merge_down(set, FALSE);
+
+  /* Add a config to the subsets, with the same name and same args. */
+  name = "<Anonymous>";
+  src = add_config_param_set(&set, name, 0);
+  src->config_type = CONF_ANON;
+
+  mark_point();
+  pr_config_merge_down(set, FALSE);
+
+  name = "<Directory>";
+  dst = add_config_param_set(&set, name, 1, "/baz");
+  dst->config_type = CONF_DIR;
+
+  name = "foo";
+  c = add_config_param_set(&(src->subset), name, 1, "alef");
+  c->flags |= CF_MERGEDOWN;
+
+  c = add_config_param_set(&(dst->subset), name, 1, "alef");
+  c->flags |= CF_MERGEDOWN;
+
+  mark_point();
+  pr_config_merge_down(set, FALSE);
+
+  /* Add a config to the subsets, with the same name and diff args. */
+  name = "alef";
+  c = add_config_param_set(&(src->subset), name, 1, "alef");
+  c->flags |= CF_MERGEDOWN;
+
+  c = add_config_param_set(&(dst->subset), name, 2, "bet", "vet");
+  c->flags |= CF_MERGEDOWN;
+
+  c = add_config_param_set(&(src->subset), "Bet", 3, "1", "2", "3");
+  c->config_type = CONF_LIMIT;
+  c->flags |= CF_MERGEDOWN;
+
+  mark_point();
+  pr_config_merge_down(set, FALSE);
+}
+END_TEST
+
 Suite *tests_get_config_suite(void) {
   Suite *suite;
   TCase *testcase;
@@ -370,17 +622,21 @@ Suite *tests_get_config_suite(void) {
   suite = suite_create("config");
 
   testcase = tcase_create("base");
-
   tcase_add_checked_fixture(testcase, set_up, tear_down);
 
-  tcase_add_test(testcase, add_remove_config_test);
-  tcase_add_test(testcase, add_config_param_set_test);
-  tcase_add_test(testcase, find_config_test);
-  tcase_add_test(testcase, find_config2_test);
-  tcase_add_test(testcase, get_param_ptr_test);
+  tcase_add_test(testcase, config_init_config_test);
+  tcase_add_test(testcase, config_add_config_test);
+  tcase_add_test(testcase, config_add_config_param_test);
+  tcase_add_test(testcase, config_add_config_param_set_test);
+  tcase_add_test(testcase, config_add_config_param_str_test);
+  tcase_add_test(testcase, config_add_server_config_param_str_test);
+  tcase_add_test(testcase, config_add_config_set_test);
+  tcase_add_test(testcase, config_find_config_test);
+  tcase_add_test(testcase, config_find_config2_test);
+  tcase_add_test(testcase, config_get_param_ptr_test);
   tcase_add_test(testcase, config_set_get_id_test);
+  tcase_add_test(testcase, config_merge_down_test);
 
   suite_add_tcase(suite, testcase);
-
   return suite;
 }

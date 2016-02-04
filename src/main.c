@@ -2,7 +2,7 @@
  * ProFTPD - FTP server daemon
  * Copyright (c) 1997, 1998 Public Flood Software
  * Copyright (c) 1999, 2000 MacGyver aka Habeeb J. Dihu <macgyver@tos.net>
- * Copyright (c) 2001-2015 The ProFTPD Project team
+ * Copyright (c) 2001-2016 The ProFTPD Project team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -84,9 +84,9 @@ static int shutting_down = 0;
 static int syntax_check = 0;
 
 /* Command handling */
-static void cmd_loop(server_rec *, conn_t *);
+static void cmd_loop(server_rec *s, conn_t *conn);
 
-static cmd_rec *make_ftp_cmd(pool *, char *, size_t, int);
+static cmd_rec *make_ftp_cmd(pool *p, char *buf, size_t buflen, int flags);
 
 static const char *config_filename = PR_CONFIG_FILE_PATH;
 
@@ -144,7 +144,8 @@ void session_exit(int pri, void *lv, int exitval, void *dummy) {
 }
 
 void shutdown_end_session(void *d1, void *d2, void *d3, void *d4) {
-  if (check_shutmsg(&shut, &deny, &disc, shutmsg, sizeof(shutmsg)) == 1) {
+  if (check_shutmsg(PR_SHUTMSG_PATH, &shut, &deny, &disc, shutmsg,
+      sizeof(shutmsg)) == 1) {
     char *user;
     time_t now;
     char *msg;
@@ -159,8 +160,15 @@ void shutdown_end_session(void *d1, void *d2, void *d3, void *d4) {
 
     c = find_config(main_server->conf, CONF_PARAM, "MasqueradeAddress", FALSE);
     if (c != NULL) {
-      pr_netaddr_t *masq_addr = (pr_netaddr_t *) c->argv[0];
-      serveraddress = pr_netaddr_get_ipstr(masq_addr);
+      pr_netaddr_t *masq_addr = NULL;
+
+      if (c->argv[0] != NULL) {
+        masq_addr = c->argv[0];
+      }
+
+      if (masq_addr != NULL) {
+        serveraddress = pr_netaddr_get_ipstr(masq_addr);
+      }
     }
 
     time(&now);
@@ -536,12 +544,16 @@ int pr_cmd_read(cmd_rec **res) {
     }
 
     cmd = make_ftp_cmd(session.pool, ptr, cmd_buflen, flags);
-    if (cmd) {
+    if (cmd != NULL) {
       *res = cmd;
 
       if (pr_cmd_is_http(cmd) == TRUE) {
         cmd->is_ftp = FALSE;
         cmd->protocol = "HTTP";
+
+      } else if (pr_cmd_is_ssh2(cmd) == TRUE) {
+        cmd->is_ftp = FALSE;
+        cmd->protocol = "SSH2";
 
       } else if (pr_cmd_is_smtp(cmd) == TRUE) {
         cmd->is_ftp = FALSE;
@@ -556,6 +568,29 @@ int pr_cmd_read(cmd_rec **res) {
   }
 
   return 0;
+}
+
+static int set_cmd_start_ms(cmd_rec *cmd) {
+  void *v;
+  uint64_t start_ms;
+
+  if (cmd->notes == NULL) {
+    return 0;
+  }
+
+  v = pr_table_get(cmd->notes, "start_ms", NULL);
+  if (v != NULL) {
+    return 0;
+  }
+
+  if (pr_gettimeofday_millis(&start_ms) < 0) {
+    return -1;
+  }
+
+  v = palloc(cmd->pool, sizeof(uint64_t));
+  memcpy(v, &start_ms, sizeof(uint64_t));
+
+  return pr_table_add(cmd->notes, "start_ms", v, sizeof(uint64_t));
 }
 
 int pr_cmd_dispatch_phase(cmd_rec *cmd, int phase, int flags) {
@@ -603,8 +638,9 @@ int pr_cmd_dispatch_phase(cmd_rec *cmd, int phase, int flags) {
     cmd->cmd_id = pr_cmd_get_id(cmd->argv[0]);
   }
 
+  set_cmd_start_ms(cmd);
+
   if (phase == 0) {
-        
     /* First, dispatch to wildcard PRE_CMD handlers. */
     success = _dispatch(cmd, PRE_CMD, FALSE, C_ANY);
 
@@ -652,7 +688,6 @@ int pr_cmd_dispatch_phase(cmd_rec *cmd, int phase, int flags) {
       errno = xerrno;
 
     } else if (success < 0) {
-
       /* Allow for non-logging command handlers to be run if CMD fails. */
 
       success = _dispatch(cmd, POST_CMD_ERR, FALSE, C_ANY);
@@ -949,13 +984,20 @@ void restart_daemon(void *d1, void *d2, void *d3, void *d4) {
     pr_event_generate("core.preparse", NULL);
 
     PRIVS_ROOT
-    if (pr_parser_parse_file(NULL, config_filename, NULL, 0) == -1) {
+    if (pr_parser_parse_file(NULL, config_filename, NULL, 0) < 0) {
       int xerrno = errno;
 
       PRIVS_RELINQUISH
-      pr_log_pri(PR_LOG_WARNING,
-        "fatal: unable to read configuration file '%s': %s", config_filename,
-        strerror(xerrno));
+
+      /* Note: EPERM is used to indicate the presence of unrecognized
+       * configuration directives in the parsed file(s).
+       */
+      if (xerrno != EPERM) {
+        pr_log_pri(PR_LOG_WARNING,
+          "fatal: unable to read configuration file '%s': %s", config_filename,
+          strerror(xerrno));
+      }
+
       pr_session_end(0);
     }
     PRIVS_RELINQUISH
@@ -1318,8 +1360,15 @@ static void fork_server(int fd, conn_t *l, unsigned char nofork) {
       c = find_config(main_server->conf, CONF_PARAM, "MasqueradeAddress",
         FALSE);
       if (c != NULL) {
-        pr_netaddr_t *masq_addr = (pr_netaddr_t *) c->argv[0];
-        serveraddress = pr_netaddr_get_ipstr(masq_addr);
+        pr_netaddr_t *masq_addr = NULL;
+
+        if (c->argv[0] != NULL) {
+          masq_addr = c->argv[0];
+        }
+
+        if (masq_addr != NULL) {
+          serveraddress = pr_netaddr_get_ipstr(masq_addr);
+        }
       }
 
       reason = sreplace(permanent_pool, shutmsg,
@@ -1482,7 +1531,8 @@ static void daemon_loop(void) {
     maxfd = semaphore_fds(&listenfds, maxfd);
 
     /* Check for ftp shutdown message file */
-    switch (check_shutmsg(&shut, &deny, &disc, shutmsg, sizeof(shutmsg))) {
+    switch (check_shutmsg(PR_SHUTMSG_PATH, &shut, &deny, &disc, shutmsg,
+        sizeof(shutmsg))) {
       case 1:
         if (!shutting_down) {
           disc_children();
@@ -1490,7 +1540,7 @@ static void daemon_loop(void) {
         shutting_down = TRUE;
         break;
 
-      case 0:
+      default:
         shutting_down = FALSE;
         deny = disc = (time_t) 0;
         break;
@@ -1772,7 +1822,8 @@ static void inetd_main(void) {
   init_bindings();
 
   /* Check our shutdown status */
-  if (check_shutmsg(&shut, &deny, &disc, shutmsg, sizeof(shutmsg)) == 1) {
+  if (check_shutmsg(PR_SHUTMSG_PATH, &shut, &deny, &disc, shutmsg,
+      sizeof(shutmsg)) == 1) {
     shutting_down = TRUE;
   }
 
@@ -2267,7 +2318,7 @@ int main(int argc, char *argv[], char **envp) {
       break;
 
     case 'l':
-      modules_list(PR_MODULES_LIST_FL_SHOW_STATIC);
+      modules_list2(NULL, PR_MODULES_LIST_FL_SHOW_STATIC);
       exit(0);
       break;
 
@@ -2406,10 +2457,16 @@ int main(int argc, char *argv[], char **envp) {
 
   pr_event_generate("core.preparse", NULL);
 
-  if (pr_parser_parse_file(NULL, config_filename, NULL, 0) == -1) {
-    pr_log_pri(PR_LOG_WARNING,
-      "fatal: unable to read configuration file '%s': %s", config_filename,
-      strerror(errno));
+  if (pr_parser_parse_file(NULL, config_filename, NULL, 0) < 0) {
+    /* Note: EPERM is used to indicate the presence of unrecognized
+     * configuration directives in the parsed file(s).
+     */
+    if (errno != EPERM) {
+      pr_log_pri(PR_LOG_WARNING,
+        "fatal: unable to read configuration file '%s': %s", config_filename,
+        strerror(errno));
+    }
+
     exit(1);
   }
 
@@ -2435,7 +2492,7 @@ int main(int argc, char *argv[], char **envp) {
     printf("  Scoreboard Version: %08x\n", PR_SCOREBOARD_VERSION); 
     printf("  Built: %s\n\n", BUILD_STAMP);
 
-    modules_list(PR_MODULES_LIST_FL_SHOW_VERSION);
+    modules_list2(NULL, PR_MODULES_LIST_FL_SHOW_VERSION);
     exit(0);
   }
 

@@ -54,6 +54,9 @@ if (scalar(@ARGV) > 0) {
 
 } else {
   $test_files = [qw(
+    t/http.t
+    t/smtp.t
+    t/ssh2.t
     t/logins.t
     t/commands/user.t
     t/commands/pass.t
@@ -95,6 +98,7 @@ if (scalar(@ARGV) > 0) {
     t/commands/mfmt.t
     t/commands/opts.t
     t/commands/host.t
+    t/commands/clnt.t
     t/commands/site/chgrp.t
     t/commands/site/chmod.t
     t/config/accessdenymsg.t
@@ -253,6 +257,11 @@ if (scalar(@ARGV) > 0) {
     't/modules/mod_delay.t' => {
       order => ++$order,
       test_class => [qw(mod_delay)],
+    },
+
+    't/modules/mod_dynmasq.t' => {
+      order => ++$order,
+      test_class => [qw(mod_dynmasq)],
     },
 
     't/modules/mod_exec.t' => {
@@ -414,6 +423,11 @@ if (scalar(@ARGV) > 0) {
     't/modules/mod_tls.t' => {
       order => ++$order,
       test_class => [qw(mod_tls)],
+    },
+
+    't/modules/mod_tls_fscache.t' => {
+      order => ++$order,
+      test_class => [qw(mod_tls_fscache)],
     },
 
     't/modules/mod_tls_memcache.t' => {

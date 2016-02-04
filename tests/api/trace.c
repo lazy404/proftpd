@@ -22,23 +22,31 @@
  * OpenSSL in the source distribution.
  */
 
-/* Trace API tests
- */
+/* Trace API tests */
 
 #include "tests.h"
 
 static pool *p = NULL;
 
+static const char *trace_path = "/tmp/prt-trace.log";
+
 static void set_up(void) {
   if (p == NULL) {
-    p = make_sub_pool(NULL);
+    p = permanent_pool = make_sub_pool(NULL);
   }
+
+  init_inet();
 }
 
 static void tear_down(void) {
+  (void) unlink(trace_path);
+
+  pr_inet_clear();
+  pr_trace_set_options(PR_TRACE_OPT_DEFAULT);
+
   if (p) {
     destroy_pool(p);
-    p = NULL;
+    p = permanent_pool = NULL;
   } 
 }
 
@@ -66,6 +74,12 @@ START_TEST (trace_set_levels_test) {
   res = pr_trace_set_levels(channel, min_level, max_level);
   fail_unless(res == 0, "Failed to handle valid channel and levels: %s",
     strerror(errno));
+
+  res = pr_trace_set_levels(PR_TRACE_DEFAULT_CHANNEL, 1, 5);
+  fail_unless(res == 0, "Failed to set default channels: %s", strerror(errno));
+
+  res = pr_trace_set_levels(PR_TRACE_DEFAULT_CHANNEL, 0, 0);
+  fail_unless(res == 0, "Failed to set default channels: %s", strerror(errno));
 }
 END_TEST
 
@@ -210,6 +224,15 @@ START_TEST (trace_parse_levels_test) {
   fail_unless(errno == EINVAL, "Failed to set errno to EINVAL, got %d (%s)",
     errno, strerror(errno));
 
+  /* Overflow the int data type, in order to get a negative number without
+   * using the dash.
+   */
+  level_str = pstrdup(p, "2147483653");
+  res = pr_trace_parse_levels(level_str, &min_level, &max_level);
+  fail_unless(res < 0, "Failed to handle negative levels string");
+  fail_unless(errno == EINVAL, "Failed to set errno to EINVAL, got %d (%s)",
+    errno, strerror(errno));
+
   level_str = pstrdup(p, "0");
   res = pr_trace_parse_levels(level_str, &min_level, &max_level);
   fail_unless(res == 0, "Failed to handle single level zero string");
@@ -221,6 +244,33 @@ START_TEST (trace_parse_levels_test) {
   fail_unless(res == 0, "Failed to handle single level string");
   fail_unless(min_level == 1, "Expected min level 1, got %d", max_level);
   fail_unless(max_level == 7, "Expected max level 7, got %d", max_level);
+
+  level_str = pstrdup(p, "abc-def");
+  res = pr_trace_parse_levels(level_str, &min_level, &max_level);
+  fail_unless(res < 0, "Failed to handle invalid levels string");
+  fail_unless(errno == EINVAL, "Failed to set errno to EINVAL, got %d (%s)",
+    errno, strerror(errno));
+
+  level_str = pstrdup(p, "1-def");
+  res = pr_trace_parse_levels(level_str, &min_level, &max_level);
+  fail_unless(res < 0, "Failed to handle invalid levels string");
+  fail_unless(errno == EINVAL, "Failed to set errno to EINVAL, got %d (%s)",
+    errno, strerror(errno));
+
+  /* Overflow the int data type, in order to get a negative number without
+   * using the dash.
+   */
+  level_str = pstrdup(p, "2147483653-10");
+  res = pr_trace_parse_levels(level_str, &min_level, &max_level);
+  fail_unless(res < 0, "Failed to handle negative levels string");
+  fail_unless(errno == EINVAL, "Failed to set errno to EINVAL, got %d (%s)",
+    errno, strerror(errno));
+
+  level_str = pstrdup(p, "10-2147483653");
+  res = pr_trace_parse_levels(level_str, &min_level, &max_level);
+  fail_unless(res < 0, "Failed to handle negative levels string");
+  fail_unless(errno == EINVAL, "Failed to set errno to EINVAL, got %d (%s)",
+    errno, strerror(errno));
 
   level_str = pstrdup(p, "-7-5");
   res = pr_trace_parse_levels(level_str, &min_level, &max_level);
@@ -248,6 +298,100 @@ START_TEST (trace_parse_levels_test) {
 }
 END_TEST
 
+START_TEST (trace_msg_test) {
+  int res;
+  char *channel, msg[16384];
+
+  res = pr_trace_msg(NULL, -1, NULL);
+  fail_unless(res < 0, "Failed to handle null arguments");
+  fail_unless(errno == EINVAL, "Expected EINVAL (%d), got %s (%d)", EINVAL,
+    strerror(errno), errno);
+
+  channel = "testsuite";
+
+  res = pr_trace_msg(channel, -1, NULL);
+  fail_unless(res < 0, "Failed to handle bad level");
+  fail_unless(errno == EINVAL, "Expected EINVAL (%d), got %s (%d)", EINVAL,
+    strerror(errno), errno);
+
+  res = pr_trace_msg(channel, 1, NULL);
+  fail_unless(res < 0, "Failed to handle null message");
+  fail_unless(errno == EINVAL, "Expected EINVAL (%d), got %s (%d)", EINVAL,
+    strerror(errno), errno);
+
+  pr_trace_set_levels(channel, 1, 10);
+
+  memset(msg, 'A', sizeof(msg)-1);
+  msg[sizeof(msg)-1] = '\0';
+  pr_trace_msg(channel, 5, "%s", msg);
+
+  session.c = pr_inet_create_conn(p, -1, NULL, INPORT_ANY, FALSE);
+  fail_unless(session.c != NULL, "Failed to create conn: %s", strerror(errno));
+  session.c->local_addr = session.c->remote_addr =
+    pr_netaddr_get_addr(p, "127.0.0.1", NULL);
+
+  res = pr_trace_set_options(PR_TRACE_OPT_LOG_CONN_IPS|PR_TRACE_OPT_USE_TIMESTAMP_MILLIS);
+  fail_unless(res == 0, "Failed to set options: %s", strerror(errno));
+  pr_trace_msg(channel, 5, "%s", "alef bet vet?");
+
+  res = pr_trace_set_options(0);
+  fail_unless(res == 0, "Failed to set options: %s", strerror(errno));
+  pr_trace_msg(channel, 5, "%s", "alef bet vet?");
+
+  pr_inet_close(p, session.c);
+  session.c = NULL;
+
+  pr_trace_set_levels(channel, 0, 0);
+}
+END_TEST
+
+START_TEST (trace_set_file_test) {
+  int res;
+  const char *path;
+
+  path = "/";
+  res = pr_trace_set_file(path);
+  fail_unless(res < 0, "Failed to handle path '%s'", path);
+  fail_unless(errno == EISDIR, "Expected EISDIR (%d), got %s (%d)", EISDIR,
+    strerror(errno), errno);
+
+  path = "/tmp";
+  res = pr_trace_set_file(path);
+  fail_unless(res < 0, "Failed to handle path '%s'", path);
+  fail_unless(errno == EISDIR, "Expected EISDIR (%d), got %s (%d)", EISDIR,
+    strerror(errno), errno);
+
+  path = trace_path;
+  res = pr_trace_set_file(path);
+  fail_unless(res == 0, "Failed to set trace file '%s': %s", path,
+    strerror(errno));
+  pr_trace_set_levels("foo", 1, 20);
+
+  pr_trace_msg("foo", 1, "bar?");
+  pr_trace_msg("foo", 1, "baz!");
+
+  res = pr_trace_set_options(PR_TRACE_OPT_LOG_CONN_IPS|PR_TRACE_OPT_USE_TIMESTAMP_MILLIS);
+  fail_unless(res == 0, "Failed to set options: %s", strerror(errno));
+
+  pr_trace_msg("foo", 1, "quxx?");
+  pr_trace_msg("foo", 1, "QUZZ!");
+
+  res = pr_trace_set_options(PR_TRACE_OPT_DEFAULT);
+  fail_unless(res == 0, "Failed to set default options: %s", strerror(errno));
+
+  pr_trace_set_levels("foo", 0, 0);
+  res = pr_trace_set_file(NULL);
+  fail_unless(res == 0, "Failed to reset trace file: %s", strerror(errno));
+
+  (void) unlink(trace_path);
+}
+END_TEST
+
+START_TEST (trace_restart_test) {
+  pr_trace_set_levels("testsuite", 1, 10);
+  pr_event_generate("core.restart", NULL);
+}
+END_TEST
 #endif /* PR_USE_TRACE */
 
 Suite *tests_get_trace_suite(void) {
@@ -257,7 +401,6 @@ Suite *tests_get_trace_suite(void) {
   suite = suite_create("trace");
 
   testcase = tcase_create("base");
-
   tcase_add_checked_fixture(testcase, set_up, tear_down);
 
 #ifdef PR_USE_TRACE
@@ -267,6 +410,9 @@ Suite *tests_get_trace_suite(void) {
   tcase_add_test(testcase, trace_get_min_level_test);
   tcase_add_test(testcase, trace_get_level_test);
   tcase_add_test(testcase, trace_parse_levels_test);
+  tcase_add_test(testcase, trace_msg_test);
+  tcase_add_test(testcase, trace_set_file_test);
+  tcase_add_test(testcase, trace_restart_test);
 #endif /* PR_USE_TRACE */
 
   suite_add_tcase(suite, testcase);
